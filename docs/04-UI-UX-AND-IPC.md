@@ -62,6 +62,7 @@ Ogni cartella nella griglia espone immediatamente il proprio contenuto visivo:
 - **Viewport 3D On-Demand (`Three.js`):**
   - Attivato cliccando *"Carica vista 3D"* o premendo `Spazio` (con caricamento automatico se il file è locale su SSD o dentro uno `.zip` locale; per file su Dropbox chiede conferma esplicita *"Scarica temporaneamente in RAM per anteprima 3D"* mostrando la dimensione in MB).
   - Shader Studio Clay / Matcap neutra per esaltare i dettagli fini delle miniature + controllo rapido assi, dimensioni reali in `mm`, conteggio triangoli e toggle wireframe.
+- **Immagini non associate:** In M1 compaiono solo in `Singoli File`, con `FileCardDto.modelId: number | null`. Se il valore è `null`, la UI non chiama `get_model_detail`.
 - **Elenco File nel Pack:** Se il modello è una cartella o uno `.zip`, mostra tutti i file contenuti (`.stl`, `.3mf`, `.lys`, `.jpg`) permettendo di ispezionare un singolo pezzo in 3D.
 - **Correzione Tag Inline:** Pillole tag con evidenza della motivazione al passaggio del mouse (es. *Dedotto da cartella "Resina"*), bottone `×` per escludere un tag errato e `+` per aggiungerne uno da quelli della tassonomia.
 

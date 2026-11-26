@@ -21,8 +21,8 @@ La Milestone M1 costruisce le fondamenta desktop di **MeshCatalog** con **Tauri 
 - Frontend UI (`src/`): `react` 19, `react-dom` 19, `@tanstack/react-virtual`, `@tauri-apps/api` v2, Vite.
 **Storage**: SQLite locale (`%LOCALAPPDATA%\MeshCatalog\catalog.db`, modalità `WAL`, `foreign_keys = ON`, tabelle virtuali `FTS5` `models_fts` e `files_fts`) dove in M1 risiedono sorgenti e catalogo (`config.json` rimandato a M2/M4); zero scritture nelle directory utente.  
 **Testing**:
-- **WSL2 (Linux):** `cargo test --manifest-path src-tauri/Cargo.toml -p meshcatalog-core` (unit & integration test di grouping, esclusione `__MACOSX`/`._*`, mock Win32 placeholder bitmask, Central Directory `.zip`, hashing incrementale, move matching, benchmark FTS5 50k+ voci) + `npm run build` (`tsc --noEmit` + Vite).
-- **Windows 10/11 (`x86_64-pc-windows-msvc`):** `npm run tauri dev` su cartella reale ~40 GB SSD + segnaposto Dropbox *Online-Only* reali.  
+- **WSL2 (Linux):** `cargo test --locked --manifest-path src-tauri/Cargo.toml -p meshcatalog-core` (unit & integration test di grouping, esclusione `__MACOSX`/`._*`, mock Win32 placeholder bitmask, Central Directory `.zip`, hashing incrementale, move matching, benchmark FTS5 50k+ voci) + `npm run build` (`tsc --noEmit` + Vite).
+- **Windows 10/11 (`x86_64-pc-windows-msvc`):** compilazione e test `meshcatalog-app` con lockfile prima degli scenari nativi T047 descritti in `quickstart.md`.
 **Target Platform**: Desktop Windows 10/11 (`x86_64-pc-windows-msvc`), sviluppato cross-OS da WSL2 Linux via GitHub (`DanieleSuppo/MeshCatalog`).  
 **Project Type**: Desktop Application (`Tauri v2`: workspace Rust backend + SPA React/TypeScript frontend).  
 **Performance Goals**:
@@ -49,6 +49,8 @@ La Milestone M1 costruisce le fondamenta desktop di **MeshCatalog** con **Tauri 
 | **III. Zero-Latency 2D Browsing vs On-Demand 3D Viewport** | PASS | PASS | La UI legge solo da SQLite (`WAL` + `FTS5`) tramite connessioni read-only dedicate; griglia e lista usano `@tanstack/react-virtual` (`< 16 ms`). Zero WebGL/Three.js e zero parsing 3D in M1; l'Inspector mostra solo metadati testuali e lista file. |
 | **IV. Code-Driven Automatic Bilingual Taxonomy (No Rule-Builder UI)** | PASS | PASS | M1 non introduce alcun tagging manuale o configuratore UI di regole; la pulizia `display_title` e il raggruppamento pack sono 100% deterministici nel codice Rust, e lo schema SQLite include già `tags`, `model_tags`, `fingerprint_overrides` e `models_fts` pronti per il motore tassonomico M3 senza migrazioni distruttive. |
 | **V. Zero Proprietary Licenses & Cross-OS WSL2 <-> Windows Verification** | PASS | PASS | Solo crate/pacchetti open-source (`rusqlite` bundled, `blake3`, `zip`, `walkdir`, `tokio`, `rayon`, React, `@tanstack/react-virtual`). La separazione in `meshcatalog-core` consente `cargo test` nativo in WSL2 Linux mentre l'app Tauri/Win32 viene verificata su Windows 10/11. |
+
+La migrazione SQLite v2 rende opzionale `files.model_id` solo per le immagini non associate. Conserva ID, riferimenti, indici, FTS e override esistenti. L'interfaccia espone questi file senza Inspector modello.
 
 Nessuna violazione della Costituzione rilevata: la sezione *Complexity Tracking* resta vuota.
 
@@ -108,7 +110,8 @@ src-tauri/                     # Cargo Workspace Rust
     └── meshcatalog-core/      # Crate pure-Rust testabile su WSL2 Linux & Windows
         ├── Cargo.toml
         ├── migrations/
-        │   └── 001_initial_schema.sql
+        │   ├── 001_initial_schema.sql
+        │   └── 002_allow_unassociated_images.sql
         ├── src/
         │   ├── lib.rs
         │   ├── contracts.rs   # DTO structs serde camelCase condivisi con IPC
@@ -123,7 +126,7 @@ src-tauri/                     # Cargo Workspace Rust
         │   │   ├── mod.rs
         │   │   ├── attr_guard.rs  # Trait MetadataInspector + Win32 Anti-Hydration Guard + test doubles
         │   │   ├── exclusions.rs  # Filtri cartelle/file di sistema, __MACOSX/, ._* e estensioni supportate
-        │   │   ├── walker.rs      # Traversal sicuro follow_links(false) + is_symlink()
+        │   │   ├── walker.rs      # Traversata: guardia symlink, reparse directory e placeholder
         │   │   ├── grouping.rs    # Regole folder_pack / zip_archive / single_file + assorbimento tecnico
         │   │   └── title.rs       # Derivazione deterministica display_title
         │   ├── archive/

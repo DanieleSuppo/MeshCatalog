@@ -12,7 +12,7 @@ Il modello dati di M1 adotta lo schema SQLite DDL definito in `docs/02-ARCHITECT
 ```text
 sources (1) ──< (N) folders (self-ref parent_id)
    │                    │
-   │                    └──< (N) models (1) ──< (N) files (self-ref parent_archive_id)
+   │                    └──< (N) models (0..1) ──< (N) files (self-ref parent_archive_id)
    │                                                  │
    └──────────────────────────────────────────────────┘
    
@@ -44,7 +44,7 @@ Rappresenta una cartella radice locale registrata dall'utente in sola lettura (i
 
 **Regole di Validazione:**
 - **Prevenzione Sovrapposizioni (FR-003):** Prima di inserire una nuova `local_dir`, il percorso canonico viene normalizzato (case-insensitive su Windows, slash `/` uniformati, rimozione trailing slash). È rifiutata se coincide con una sorgente esistente, è discendente di una sorgente esistente, oppure è antenata di una sorgente esistente.
-- **Protezione Sorgente Irraggiungibile:** Se `root_uri` non è accessibile all'avvio scansione, `status` passa a `'unavailable'`, viene registrato `last_error` e nessun record `folders`/`models`/`files` della sorgente viene eliminato.
+- **Protezione Sorgente Irraggiungibile:** Se `root_uri` non è accessibile all'avvio della scansione o al controllo prima del pruning, `status` passa a `'unavailable'`, viene registrato `last_error` e il pruning non viene eseguito. Se fallisce la traversata di un sottoalbero, la scansione prosegue sulle altre cartelle, termina con `status = 'error'` e salta il pruning.
 
 ---
 
@@ -95,7 +95,7 @@ Unità logica mostrata nella vista predefinita **Modelli / Pack**.
 **Regole di Raggruppamento Deterministiche (FR-007) e `models.folder_id`:**
 1. **`zip_archive`**: ogni file `.zip` rilevato (residente o placeholder), associato al `folder_id` della cartella che lo contiene.
 2. **`folder_pack`**: cartella `P` che contiene (direttamente o tramite sottocartelle tecniche terminali assorbite `STL`, `STLs`, `Presupported`, `Pre-supported`, `Supported`, `Unsupported`, `Images`, `Renders`, `Render`, `Lychee`, `Files`, o scale `32mm`/`75mm`) almeno `2` file 3D/slicer non-`.zip`, oppure `1` file 3D/slicer + `>= 1` immagine supportata. Se `P` è una **cartella foglia** (non è la radice sorgente e non contiene ulteriori sottocartelle non-tecniche né `.zip`), `P` stessa viene rappresentata dal `folder_pack` con `models.folder_id = id(parent(P))` e **non** genera una riga `folders` separata (così navigando `parent(P)` l'utente vede direttamente le card dei modelli invece di cartelle mono-modello). Se invece `P` contiene anche sottocartelle non-tecniche o `.zip` (cartella mista), `P` mantiene la propria riga in `folders` e il pack dei file diretti usa `models.folder_id = id(P)`.
-3. **`single_file`**: singolo file 3D/slicer isolato senza compagni né immagini nella stessa cartella, associato al `folder_id` della cartella contenitore (o `parent(P)` se l'intera cartella foglia contiene solo quel file + eventuali sottocartelle tecniche assorbite).
+3. **`single_file`**: singolo file 3D/slicer isolato senza compagni né immagini nella stessa cartella, associato al `folder_id` della cartella che lo contiene.
 
 ---
 
@@ -105,7 +105,7 @@ Rappresenta ogni file supportato scoperto su disco o nella Central Directory di 
 | Colonna | Tipo SQLite | Vincoli / Note |
 | :--- | :--- | :--- |
 | `id` | `INTEGER PRIMARY KEY` | Identificativo univoco |
-| `model_id` | `INTEGER NOT NULL` | `REFERENCES models(id) ON DELETE CASCADE` |
+| `model_id` | `INTEGER` | `REFERENCES models(id) ON DELETE CASCADE`; `NULL` solo per immagini non associate, mai per entry ZIP |
 | `source_id` | `INTEGER NOT NULL` | `REFERENCES sources(id) ON DELETE CASCADE` |
 | `folder_id` | `INTEGER` | `REFERENCES folders(id) ON DELETE SET NULL` |
 | `parent_archive_id` | `INTEGER` | `REFERENCES files(id) ON DELETE CASCADE` (valorizzato per `zip_entry`) |
@@ -124,6 +124,10 @@ Rappresenta ogni file supportato scoperto su disco o nella Central Directory di 
 | `bbox_x_mm` / `y` / `z` | `REAL` | `NULL` in M1 (popolato in M2 Pass 3) |
 | `thumb_id` | `INTEGER` | `NULL` in M1 (popolato in M2) |
 | `index_pass` | `INTEGER NOT NULL DEFAULT 1` | `1` = inventario veloce, `2` = hash + ZIP Central Directory |
+
+Le immagini non associate conservano `source_id`, `folder_id` e una riga `files_fts`. Concorrono ai conteggi dei file, non a quelli dei modelli. Le immagini in pack o archivi mantengono il proprio `model_id`.
+
+La migrazione `002_allow_unassociated_images.sql` ricostruisce `files` nella transazione versionata, conserva ID e riferimenti (inclusi quelli tra voci ZIP), ricrea gli indici e non modifica FTS o override. Il binario v1 rifiuta il catalogo v2: per tornare a v1 serve una copia del catalogo precedente alla migrazione.
 
 **Macchina a Stati di `storage_state` e `index_pass` in M1:**
 - Placeholder Win32 (`FILE_ATTRIBUTE_OFFLINE` o `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`): creato subito con `storage_state = 'cloud_placeholder'`, `content_hash = NULL`, `index_pass = 2` (nessuna apertura file né in Pass 1 né in Pass 2).
@@ -165,6 +169,7 @@ CREATE VIRTUAL TABLE files_fts USING fts5(
   - `idx_files_model ON files(model_id)`
   - `idx_files_folder ON files(folder_id)`
   - `idx_files_ext ON files(ext)`
+  - `idx_files_source ON files(source_id)`
   - `idx_files_parent_archive ON files(parent_archive_id) WHERE parent_archive_id IS NOT NULL`
 
 ### 2.6 Riconciliazione Spostamenti e Sincronizzazione `FTS5`

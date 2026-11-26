@@ -21,12 +21,12 @@ Questo documento consolida le decisioni tecniche della Milestone M1, risolvendo 
 ## 2. Scudo Anti-Idratazione Win32 & Traversal Sicuro NTFS
 
 - **Decisione:**
-  - Definire in `meshcatalog-core` un'astrazione `EntryMetadataInspector` che ispeziona gli attributi senza mai aprire handle di lettura dati (`std::fs::symlink_metadata` / `DirEntry::metadata` su `walkdir` con `follow_links(false)`).
+  - Definire in `meshcatalog-core` un'astrazione `EntryMetadataInspector` che ispeziona gli attributi senza mai aprire handle di lettura dati (`std::fs::symlink_metadata`).
   - Su Windows (`#[cfg(target_os = "windows")]`), usare `std::os::windows::fs::MetadataExt::file_attributes()` controllando:
     - `FILE_ATTRIBUTE_OFFLINE` (`0x0000_1000`)
     - `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` (`0x0040_0000`)
     - `FILE_ATTRIBUTE_RECALL_ON_OPEN` (`0x0004_0000`) come ulteriore difesa in profondità sui placeholder Cloud Files.
-  - Per i collegamenti simbolici e le junction NTFS di directory: usare `walkdir::WalkDir::new(root).follow_links(false)` combinato con `file_type().is_symlink()` (in Rust su Windows `is_symlink()` riconosce sia `IO_REPARSE_TAG_SYMLINK` sia `IO_REPARSE_TAG_MOUNT_POINT` / junction NTFS, senza bloccare le directory placeholder Cloud Files che usano tag `IO_REPARSE_TAG_CLOUD_*`).
+  - Controllare i metadati prima di `std::fs::read_dir`. Saltare i symlink e non attraversare directory con `FILE_ATTRIBUTE_REPARSE_POINT` (`0x0400`), anche se `is_symlink()` restituisce `false`. Le directory con bit di richiamo/offline restano nel catalogo come directory opache, senza enumerazione né pruning basato sulla loro mancata enumerazione.
   - Introdurre un `MockMetadataInspector` (o helper basato su struct `RawWin32AttrFlags { file_attributes: u32, is_symlink: bool }`) per testare su WSL2 tutte le combinazioni di bit Win32, junction e placeholder misti.
 - **Motivazione:** Garantisce **0 byte** scaricati da Dropbox Smart Sync (Principio II / SC-001) e impedisce loop infiniti o uscite dalla radice autorizzata su junction NTFS (FR-005).
 - **Alternative considerate:**
@@ -48,7 +48,7 @@ Questo documento consolida le decisioni tecniche della Milestone M1, risolvendo 
     3. Sui file non-`.zip` raccolti in `P` (diretti + assorbiti):
        - `count(3d_slicer) >= 2` oppure (`count(3d_slicer) == 1 && count(images) >= 1`) $\rightarrow$ `folder_pack`.
        - `count(3d_slicer) == 1 && count(images) == 0` $\rightarrow$ `single_file`.
-       - `count(3d_slicer) == 0` $\rightarrow$ nessun `Model` 3D spurio creato per cartelle di sole immagini generiche non assorbite.
+       - `count(3d_slicer) == 0` $\rightarrow$ nessun `Model` 3D per le sole immagini non associate. Tali immagini rimangono in `files` con `model_id = NULL` e in `files_fts`, nello scope di cartella e sorgente.
   - **Pulizia `display_title`:** Pipeline deterministica in Rust (`title_cleaner.rs`) che normalizza separatori (`_`, `.`), rimuove prefissi data/release (`2025_03_`, `[Creator]`), rimuove token tecnici (`presupported`, `unsupported`, `32mm`, `v2`, `stl`, `3mf`), preserva una leggibilità naturale e ricade sempre su `raw_name` se la stringa ripulita risultasse vuota.
 - **Motivazione:** Rispecchia esattamente la Chiarificazione 1 & 5 di `spec.md`, evita di esplodere un singolo modello in decine di card o cartelle tecniche `STL/` / `Presupported/` nell'albero navigabile, e garantisce compatibilità immediata con il futuro Segnale 3 del Motore Tassonomico (M3).
 
@@ -58,7 +58,7 @@ Questo documento consolida le decisioni tecniche della Milestone M1, risolvendo 
 
 - **Decisione:**
   - Utilizzare `rusqlite` con feature `bundled` (SQLite >= 3.45 con `FTS5` compilato staticamente), `PRAGMA journal_mode = WAL`, `PRAGMA foreign_keys = ON`, `PRAGMA synchronous = NORMAL`, `PRAGMA busy_timeout = 5000`.
-  - Adottare uno schema compatibile fin da M1 con il DDL master di `docs/02-ARCHITECTURE.md` (`sources`, `folders`, `models`, `files`, `thumbnails`, `tags`, `model_tags`, `fingerprint_overrides`, `models_fts`), estendendo `folders`, `sources` e `models` solo con colonne additive non distruttive per i requisiti M1 (`recursive_model_count`, `recursive_file_count`, `nested_folder_count`, `sample_titles_json`, `has_cloud_placeholder`, `primary_ext`) più `files_fts` per rendere istantanea (`< 100 ms`) anche la ricerca in vista **Singoli File**.
+  - Adottare uno schema compatibile fin da M1 con il DDL master di `docs/02-ARCHITECTURE.md` (`sources`, `folders`, `models`, `files`, `thumbnails`, `tags`, `model_tags`, `fingerprint_overrides`, `models_fts`), con migrazione v2 per le immagini non associate ed estensioni additive a `folders`, `sources` e `models` per i requisiti M1 (`recursive_model_count`, `recursive_file_count`, `nested_folder_count`, `sample_titles_json`, `has_cloud_placeholder`, `primary_ext`) più `files_fts` per rendere istantanea (`< 100 ms`) anche la ricerca in vista **Singoli File**.
   - **Separazione Writer / Readers:** Un singolo task/thread writer dedicato esegue le scritture batchate in transazioni SQLite (`500–1000` record per commit) durante la scansione; un pool leggero di connessioni `SQLITE_OPEN_READ_ONLY` serve le query IPC della UI senza mai bloccare lo scorrimento o la ricerca.
   - **Ricerca ricorsiva per sotto-albero:** Dato un `folder_id` selezionato, una CTE ricorsiva `WITH RECURSIVE subtree(id) AS (...)` su `folders(parent_id)` (indicizzata) combinata con `models_fts MATCH ?` / `files_fts MATCH ?` isola il sotto-albero in `< 1 ms`, mantenendo latenza totale `< 30–50 ms` su 50k+ voci.
 - **Motivazione:** Garantisce il rispetto del budget `< 100 ms` (SC-006) anche mentre Pass 1/Pass 2 stanno scrivendo in background (FR-010).

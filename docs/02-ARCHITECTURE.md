@@ -145,7 +145,7 @@ CREATE TABLE models (
 
 CREATE TABLE files (
     id               INTEGER PRIMARY KEY,
-    model_id         INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    model_id         INTEGER REFERENCES models(id) ON DELETE CASCADE, -- NULL solo per immagini non associate
     source_id        INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     folder_id        INTEGER REFERENCES folders(id) ON DELETE SET NULL,
     parent_archive_id INTEGER REFERENCES files(id) ON DELETE CASCADE, -- valorizzato se dentro uno .zip
@@ -165,7 +165,10 @@ CREATE TABLE files (
     bbox_y_mm        REAL,
     bbox_z_mm        REAL,
     thumb_id         INTEGER,
-    index_pass       INTEGER NOT NULL DEFAULT 1 -- 1=tree, 2=meta/tax, 3=geometry/render
+    index_pass       INTEGER NOT NULL DEFAULT 1, -- 1=tree, 2=meta/tax, 3=geometry/render
+    CHECK (model_id IS NOT NULL OR (
+        ext IN ('jpg', 'jpeg', 'png', 'webp') AND parent_archive_id IS NULL AND storage_state <> 'zip_entry'
+    ))
 );
 
 CREATE INDEX idx_files_hash ON files(content_hash) WHERE content_hash IS NOT NULL;

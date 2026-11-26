@@ -76,7 +76,7 @@ export interface ModelCardDto {
 
 export interface FileCardDto {
   id: number;
-  modelId: number;
+  modelId: number | null; // nullo solo per immagini non associate; non aprire l'Inspector modello
   sourceId: number;
   folderId: number | null;
   parentArchiveId: number | null;
@@ -167,9 +167,11 @@ export interface ScanStatusDto {
 | :--- | :--- | :--- | :--- |
 | `get_folder_tree` | `sourceFilter: SourceFilter` | `FolderTreeNode[]` | Legge da SQLite solo le `folders` non-tecniche, costruendo l'albero per l'UI sidebar. |
 | `search_catalog` | `query: SearchQuery` | `SearchResultPage` | Legge solo SQLite (`WAL` + `FTS5`). **Caso 1 (`text.trim() === ""` e `folderId === null`):** vista radice "Tutte le sorgenti" (o filtrata su `sourceId`/`sourceFilter`) — restituisce in `subfolders` le cartelle radice delle sorgenti (`parent_id IS NULL` con conteggi ricorsivi e `sampleTitles`) e `items = []`. **Caso 2 (`text.trim() === ""` e `folderId != null`):** restituisce `subfolders` (sottocartelle dirette non-tecniche con `recursiveModelCount`, `recursiveFileCount`, `nestedFolderCount`, `sampleTitles`) + `items` diretti del livello. **Caso 3 (`text.trim() !== ""`):** `subfolders` è `[]` e la query utente viene sanitizzata/tokenizzata per `FTS5` (proteggendo `-`, `.`, `"`, `*`) filtrando ricorsivamente l'intero sotto-albero (o tutte le sorgenti se `folderId === null`) su `models_fts` (`viewMode === 'models'`) o `files_fts` (`viewMode === 'files'`). |
-| `get_model_detail` | `modelId: number` | `ModelDetailDto` | Restituisce i metadati del modello e l'elenco completo e ordinato di tutti i `CatalogFile` associati. Nessun parsing mesh né decodifica immagini in M1. |
+| `get_model_detail` | `modelId: number` | `ModelDetailDto` | Restituisce i metadati del modello e l'elenco completo e ordinato dei file associati, con percorsi relativi interni. Nessun parsing mesh né decodifica immagini in M1. |
 
 ---
+
+Le immagini non associate sono restituite solo in vista `files` e concorrono a `totalFiles`, anche con ricerca ricorsiva. La UI non deve chiamare `get_model_detail(null)`.
 
 ## 3. Formato Errori Strutturati (`IpcError`)
 
