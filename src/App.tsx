@@ -158,7 +158,7 @@ export function App() {
         <p role="status">{page ? `${modelCountLabel(page.totalModels)} · ${formatNumber(page.totalFiles)} file${text ? ' nella ricerca' : ''}` : catalog.error ? 'Conteggi non disponibili' : 'Lettura del catalogo…'}</p>
       </div>
       {catalog.error && <div className="notice" role="alert">{catalog.error} <button onClick={catalog.retry}>Riprova</button></div>}
-      {hasContent ? <CatalogGrid query={query} firstPage={page} selectedItemId={selection?.itemId ?? null} onOpen={f => navigate(f.sourceId, f.id)} onInspect={inspect} />
+      {hasContent ? <CatalogGrid query={query} firstPage={page} revision={revision} selectedItemId={selection?.itemId ?? null} onOpen={f => navigate(f.sourceId, f.id)} onInspect={inspect} />
         : page && !catalog.error ? <EmptyCatalog title={text ? 'Nessun risultato' : firstRun ? 'Il catalogo è vuoto' : 'Nessun elemento indicizzato'}>
           <p>{text ? 'Prova un altro titolo, percorso o formato.' : firstRun ? 'Aggiungi la prima cartella dei modelli. I file originali restano sul disco, in sola lettura.' : 'Avvia una scansione o scegli un’altra cartella.'}</p>
           {text ? <button onClick={() => setSearchText('')}>Cancella ricerca</button> : firstRun ? <button onClick={addFolder}>Aggiungi cartella</button> : null}

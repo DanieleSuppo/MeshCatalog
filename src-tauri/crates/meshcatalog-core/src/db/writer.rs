@@ -13,9 +13,9 @@ use crate::{
     hasher::fingerprint,
     scanner::{
         attr_guard::unix_seconds,
-        grouping::{is_image, parent_path, Grouping},
+        grouping::{is_image, parent_path, technical, Grouping},
         title::display_title,
-        walker::InventoryEntry,
+        walker::{InventoryEntry, WalkCoverage},
     },
 };
 
@@ -33,13 +33,19 @@ pub(crate) fn write_inventory_batch(
         let mut models = BTreeSet::new();
         for entry in entries {
             match entry {
-                InventoryEntry::Directory { rel_path, name, .. } => {
-                    let id = upsert_folder(&tx, source_id, rel_path, if rel_path.is_empty() { &source_name } else { name })?;
+                InventoryEntry::Directory { rel_path, name, opaque } => {
+                    // A new technical child may disappear into its parent pack at grouping.
+                    let visible = *opaque || parent_path(rel_path).is_empty() || !technical(name);
+                    let id = upsert_folder(&tx, source_id, rel_path,
+                        if rel_path.is_empty() { &source_name } else { name }, visible)?;
                     folders.insert(id);
                 }
-                InventoryEntry::OtherFile { .. } => {}
+                InventoryEntry::UnobservedLink { .. } => {}
                 InventoryEntry::File { rel_path, name, ext, metadata } => {
                     let folder = folder_id(&tx, source_id, parent_path(rel_path))?;
+                    if ext == "zip" {
+                        reveal_folder(&tx, folder)?;
+                    }
                     let uri = local_uri(&root, rel_path);
                     let cloud = metadata.flags.is_placeholder();
                     let storage = if cloud { "cloud_placeholder" } else { "local_resident" };
@@ -99,6 +105,8 @@ pub(crate) fn write_groups(
     db: &Database,
     source_id: i64,
     grouping: &Grouping<'_>,
+    entries: &[InventoryEntry],
+    history: &ModelHistory,
 ) -> Result<IndexerBatchUpdatedEvent, IpcError> {
     db.with_writer(|conn| {
         let tx = conn.transaction()?;
@@ -134,21 +142,29 @@ pub(crate) fn write_groups(
             )?.query_row(params![uri, folder, member.name], |r| r.get(0))?;
             sync_file_fts(&tx, file_id, None, member.name, member.path, member.ext)?;
         }
-        // Keep historical models available for move matching even if regrouping emptied them.
-        let empty = "SELECT id FROM models WHERE source_id=?1 AND fingerprint IS NULL AND NOT EXISTS (SELECT 1 FROM files WHERE model_id=models.id)";
-        tx.execute(&format!("DELETE FROM models_fts WHERE rowid IN ({empty})"), [source_id])?;
-        tx.execute(&format!("DELETE FROM models WHERE id IN ({empty})"), [source_id])?;
-        for path in grouping.folded.iter().rev() {
-            tx.prepare_cached(
-                "DELETE FROM folders WHERE source_id=?1 AND rel_path=?2
-                   AND NOT EXISTS (SELECT 1 FROM files WHERE folder_id=folders.id)
-                   AND NOT EXISTS (SELECT 1 FROM models WHERE folder_id=folders.id)
-                   AND NOT EXISTS (SELECT 1 FROM folders child WHERE child.source_id=?1 AND child.parent_id=folders.id)",
-            )?.execute(params![source_id, path])?;
-        }
         for &id in &model_ids {
             sync_model(&tx, &root, id)?;
         }
+        // Models emptied by regrouping need not survive until move reconciliation unless historical.
+        let empty = tx.prepare_cached(
+            "SELECT id,canonical_uri FROM models m WHERE source_id=?1 AND container_kind='single_file'
+             AND NOT EXISTS (SELECT 1 FROM files WHERE model_id=m.id)",
+        )?.query_map([source_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+          .collect::<Result<Vec<_>, _>>()?;
+        for (id, uri) in empty {
+            if !history.contains_key(source_relative(&root, &uri)?) {
+                delete_model(&tx, id)?;
+            }
+        }
+        let mut visibility = tx.prepare_cached(
+            "UPDATE folders SET is_visible=?3 WHERE source_id=?1 AND rel_path=?2 AND is_visible<>?3",
+        )?;
+        for entry in entries {
+            if let InventoryEntry::Directory { rel_path, .. } = entry {
+                visibility.execute(params![source_id, rel_path, !grouping.folded.contains(rel_path.as_str())])?;
+            }
+        }
+        drop(visibility);
         let folder_ids = refresh_folders(&tx, source_id)?;
         tx.commit()?;
         Ok(IndexerBatchUpdatedEvent { source_id, updated_model_ids: model_ids.into_iter().collect(), updated_folder_ids: folder_ids })
@@ -241,15 +257,60 @@ pub(crate) fn write_analysis(
     })
 }
 
-pub(crate) type ModelHistory = BTreeMap<String, (i64, Option<String>)>;
+pub(crate) struct HistoricalModel {
+    fingerprint: Option<String>,
+    pub pack: bool,
+    cloud: bool,
+}
+
+pub(crate) type ModelHistory = BTreeMap<String, HistoricalModel>;
 
 pub(crate) fn scan_history(db: &Database, source_id: i64) -> Result<ModelHistory, IpcError> {
     db.with_reader(|conn| {
-        let mut stmt =
-            conn.prepare("SELECT canonical_uri,id,fingerprint FROM models WHERE source_id=?1")?;
-        let rows = stmt.query_map([source_id], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let sql = "SELECT root_uri FROM sources WHERE id=?1";
+        let root: String = conn.query_row(sql, [source_id], |r| r.get(0))?;
+        let mut stmt = conn.prepare("SELECT canonical_uri,fingerprint,container_kind='folder_pack',has_cloud_placeholder FROM models WHERE source_id=?1")?;
+        let mut rows = stmt.query([source_id])?;
+        let mut history = ModelHistory::new();
+        while let Some(row) = rows.next()? {
+            let uri: String = row.get(0)?;
+            let path = source_relative(&root, &uri)?;
+            history.insert(path.to_owned(), HistoricalModel { fingerprint: row.get(1)?, pack: row.get(2)?, cloud: row.get(3)? });
+        }
+        Ok(history)
     })
+}
+
+pub(crate) fn legacy_root_children(
+    db: &Database,
+    source_id: i64,
+) -> Result<BTreeSet<String>, IpcError> {
+    db.with_reader(|conn| {
+        let mut rows = conn.prepare(
+            "SELECT DISTINCT substr(f.rel_path,1,instr(f.rel_path,'/')-1)
+             FROM sources s JOIN models m ON m.canonical_uri=s.root_uri
+             JOIN files f ON f.model_id=m.id
+             WHERE s.id=?1 AND m.container_kind='folder_pack'
+               AND f.parent_archive_id IS NULL AND instr(f.rel_path,'/')>0",
+        )?;
+        let names = rows.query_map([source_id], |r| r.get::<_, String>(0))?;
+        let mut children = BTreeSet::new();
+        for name in names {
+            let name = name?;
+            if technical(&name) {
+                children.insert(WalkCoverage::key(&name));
+            }
+        }
+        Ok(children)
+    })
+}
+
+struct ScanFile {
+    id: i64,
+    uri: String,
+    hash: Option<String>,
+    size: i64,
+    cloud: bool,
 }
 
 pub(crate) fn finish_scan(
@@ -258,6 +319,7 @@ pub(crate) fn finish_scan(
     entries: &[InventoryEntry],
     grouping: &Grouping<'_>,
     history: &ModelHistory,
+    coverage: &WalkCoverage,
 ) -> Result<IndexerBatchUpdatedEvent, IpcError> {
     db.with_writer(|conn| {
         let tx = conn.transaction()?;
@@ -266,108 +328,196 @@ pub(crate) fn finish_scan(
         let mut live_folders = BTreeSet::new();
         for entry in entries {
             match entry {
-                InventoryEntry::File { rel_path, .. } => { live_files.insert(local_uri(&root, rel_path)); }
-                InventoryEntry::Directory { rel_path, .. } if !grouping.folded.contains(rel_path.as_str()) => {
+                InventoryEntry::File { rel_path, .. } => {
+                    live_files.insert(rel_path.as_str());
+                }
+                InventoryEntry::Directory { rel_path, .. } => {
                     live_folders.insert(rel_path.as_str());
                 }
                 _ => {}
             }
         }
-        let mut changed_models = prune_files(&tx, source_id, &live_files)?;
-        let live_models: BTreeSet<_> = grouping.models.iter().map(|m| local_uri(&root, m.path)).collect();
+        let mut files = read_scan_files(&tx, source_id)?;
+        let live_models: BTreeSet<_> = grouping.models.iter().map(|model| model.path).collect();
         let mut missing = BTreeMap::<_, Vec<_>>::new();
-        for (uri, (id, hash)) in history {
-            if !live_models.contains(uri) {
-                if let Some(hash) = hash { missing.entry(hash.as_str()).or_default().push(*id); }
-            }
-        }
         let mut new = BTreeMap::<String, Vec<i64>>::new();
         let mut active = BTreeSet::new();
-        let mut model_rows = tx.prepare("SELECT id,canonical_uri,container_kind FROM models WHERE source_id=?1")?;
-        let mut rows = model_rows.query([source_id])?;
+        let mut resync = BTreeSet::new();
+        let mut prune_files = Vec::new();
         let mut obsolete = BTreeSet::new();
+        let mut model_rows =
+            tx.prepare("SELECT id,canonical_uri,container_kind FROM models WHERE source_id=?1")?;
+        let mut rows = model_rows.query([source_id])?;
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
             let uri: String = row.get(1)?;
-            if !live_models.contains(&uri) {
-                obsolete.insert(id);
-                continue;
-            }
+            let path = source_relative(&root, &uri)?;
             let kind: String = row.get(2)?;
-            let mut members = tx.prepare_cached(
-                "SELECT content_hash,size_bytes FROM files WHERE model_id=?1 AND storage_state='local_resident' AND content_hash IS NOT NULL",
-            )?;
-            let members = members.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-            let hash = fingerprint(&kind, members);
-            tx.prepare_cached("UPDATE models SET fingerprint=?2 WHERE id=?1 AND fingerprint IS NOT ?2")?.execute(params![id, hash])?;
-            if !history.contains_key(&uri) {
-                if let Some(hash) = hash { new.entry(hash).or_default().push(id); }
+            let pack = kind == "folder_pack";
+            let members = files.entry(Some(id)).or_default();
+            let mut unobserved =
+                coverage.protects_history(path) || (pack && grouping.incomplete_pack(path));
+            let mut has_live_file = false;
+            let mut stale = Vec::new();
+            let mut hashes = Vec::new();
+            let mut historical_hashes = Vec::new();
+            let mut analyzed = true;
+            let mut cloud = false;
+            for file in members {
+                let path = source_relative(&root, &file.uri)?;
+                if live_files.contains(path) {
+                    has_live_file = true;
+                    cloud |= file.cloud;
+                    if let Some(hash) = file.hash.take() {
+                        hashes.push((hash, file.size));
+                    } else if !file.cloud {
+                        analyzed = false;
+                    }
+                } else if coverage.protects_history(path) {
+                    unobserved = true;
+                } else {
+                    stale.push(file.id);
+                    if let Some(hash) = file.hash.take() {
+                        historical_hashes.push((hash, file.size));
+                    }
+                }
             }
-            active.insert(id);
+            if !coverage.incomplete && !stale.is_empty() {
+                prune_files.extend_from_slice(&stale);
+                resync.insert(id);
+            }
+            if live_models.contains(path) {
+                active.insert(id);
+                if !unobserved && analyzed && (stale.is_empty() || !coverage.incomplete) {
+                    let hash = fingerprint(&kind, hashes);
+                    tx.prepare_cached(
+                        "UPDATE models SET fingerprint=?2 WHERE id=?1 AND fingerprint IS NOT ?2",
+                    )?
+                    .execute(params![id, hash])?;
+                    if !history.contains_key(path) && !cloud {
+                        if let Some(hash) = hash {
+                            new.entry(hash).or_default().push(id);
+                        }
+                    }
+                }
+            } else if !unobserved {
+                if let Some(previous) = history.get(path) {
+                    // A path still observed on disk may simply have been regrouped.
+                    if !previous.cloud
+                        && !has_live_file
+                        && !live_files.contains(path)
+                        && !live_folders.contains(path)
+                    {
+                        if let Some(hash) = &previous.fingerprint {
+                            // A retained fingerprint is not proof if member analysis failed
+                            // or regrouping changed the old set in an earlier partial run.
+                            if stale.len() == historical_hashes.len()
+                                && fingerprint(&kind, historical_hashes).as_ref() == Some(hash)
+                            {
+                                missing.entry(hash.as_str()).or_default().push((id, stale));
+                            }
+                        }
+                    }
+                    if !coverage.incomplete && !has_live_file {
+                        obsolete.insert(id);
+                    }
+                } else if !has_live_file && (!coverage.incomplete || stale.is_empty()) {
+                    // Empty Pass 1 provisional model, not a historical deletion.
+                    obsolete.insert(id);
+                }
+            }
         }
         drop(rows);
+        drop(model_rows);
+        // General pruning requires a complete walk; protected paths are never pruned.
+        if !coverage.incomplete {
+            for file in files.get(&None).into_iter().flatten() {
+                let path = source_relative(&root, &file.uri)?;
+                if !live_files.contains(path) && !coverage.protects_history(path) {
+                    prune_files.push(file.id);
+                }
+            }
+            delete_disk_files(&tx, &prune_files)?;
+        }
         for (hash, destinations) in new {
-            if let ([destination], Some([original])) = (destinations.as_slice(), missing.get(hash.as_str()).map(Vec::as_slice)) {
+            if let ([destination], Some([(original, stale)])) = (
+                destinations.as_slice(),
+                missing.get(hash.as_str()).map(Vec::as_slice),
+            ) {
+                // Only the confirmed move's old rows are removed on a partial walk.
+                if coverage.incomplete {
+                    delete_disk_files(&tx, stale)?;
+                }
                 reconcile_move(&tx, *original, *destination)?;
                 obsolete.remove(original);
                 active.remove(destination);
                 active.insert(*original);
-                changed_models.insert(*original);
+                resync.insert(*original);
             }
         }
         for id in obsolete {
-            // Surviving files were all reassigned by grouping before reaching this transaction.
             delete_model(&tx, id)?;
         }
-        let folders = tx.prepare("SELECT id,rel_path FROM folders WHERE source_id=?1 ORDER BY rel_path DESC")?
-            .query_map([source_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+        let folders = tx
+            .prepare("SELECT id,rel_path FROM folders WHERE source_id=?1 ORDER BY rel_path DESC")?
+            .query_map([source_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         for (id, path) in folders {
-            if !live_folders.contains(path.as_str()) {
-                tx.prepare_cached("DELETE FROM folders WHERE id=?1")?.execute([id])?;
+            if !coverage.protects_history(&path)
+                && (grouping.folded.contains(path.as_str())
+                    || (!coverage.incomplete && !live_folders.contains(path.as_str())))
+            {
+                tx.prepare_cached(
+                    "DELETE FROM folders WHERE id=?1
+                     AND NOT EXISTS (SELECT 1 FROM files WHERE folder_id=?1)
+                     AND NOT EXISTS (SELECT 1 FROM models WHERE folder_id=?1)
+                     AND NOT EXISTS (SELECT 1 FROM folders WHERE parent_id=?1)",
+                )?
+                .execute([id])?;
             }
         }
-        for &id in changed_models.intersection(&active) { sync_model(&tx, &root, id)?; }
+        for &id in resync.intersection(&active) {
+            sync_model(&tx, &root, id)?;
+        }
         let folders = refresh_folders(&tx, source_id)?;
-        drop(model_rows);
         tx.commit()?;
-        Ok(IndexerBatchUpdatedEvent { source_id, updated_folder_ids: folders, updated_model_ids: active.into_iter().collect() })
+        Ok(IndexerBatchUpdatedEvent {
+            source_id,
+            updated_folder_ids: folders,
+            updated_model_ids: active.into_iter().collect(),
+        })
     })
 }
 
-fn prune_files(
+fn read_scan_files(
     tx: &Transaction<'_>,
     source_id: i64,
-    live: &BTreeSet<String>,
-) -> rusqlite::Result<BTreeSet<i64>> {
-    let mut files = tx.prepare(
-        "SELECT id,uri,ext,model_id FROM files WHERE source_id=?1 AND parent_archive_id IS NULL",
-    )?;
-    let stale = files
-        .query_map([source_id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut affected = BTreeSet::new();
-    for (id, uri, ext, model) in stale {
-        if !live.contains(&uri) {
-            if let Some(model) = model {
-                affected.insert(model);
-            }
-            if ext == "zip" {
-                tx.prepare_cached("DELETE FROM files_fts WHERE rowid IN (SELECT id FROM files WHERE parent_archive_id=?1)")?.execute([id])?;
-            }
-            tx.prepare_cached("DELETE FROM files_fts WHERE rowid=?1")?
-                .execute([id])?;
-            tx.prepare_cached("DELETE FROM files WHERE id=?1")?
-                .execute([id])?;
-        }
+) -> rusqlite::Result<BTreeMap<Option<i64>, Vec<ScanFile>>> {
+    let mut stmt = tx.prepare("SELECT id,uri,content_hash,size_bytes,storage_state='cloud_placeholder',model_id FROM files WHERE source_id=?1 AND parent_archive_id IS NULL")?;
+    let mut rows = stmt.query([source_id])?;
+    let mut files = BTreeMap::<_, Vec<_>>::new();
+    while let Some(row) = rows.next()? {
+        files.entry(row.get(5)?).or_default().push(ScanFile {
+            id: row.get(0)?,
+            uri: row.get(1)?,
+            hash: row.get(2)?,
+            size: row.get(3)?,
+            cloud: row.get(4)?,
+        });
     }
-    Ok(affected)
+    Ok(files)
+}
+
+fn delete_disk_files(tx: &Transaction<'_>, ids: &[i64]) -> rusqlite::Result<()> {
+    let mut fts = tx.prepare_cached("DELETE FROM files_fts WHERE rowid=?1 OR rowid IN (SELECT id FROM files WHERE parent_archive_id=?1)")?;
+    let mut files = tx.prepare_cached("DELETE FROM files WHERE id=?1")?;
+    for id in ids {
+        fts.execute([id])?;
+        files.execute([id])?;
+    }
+    Ok(())
 }
 
 fn delete_model(tx: &Transaction<'_>, id: i64) -> rusqlite::Result<()> {
@@ -417,22 +567,6 @@ fn reconcile_move(tx: &Transaction<'_>, original: i64, destination: i64) -> rusq
     Ok(())
 }
 
-pub(crate) fn write_folder_aggregates(
-    db: &Database,
-    source_id: i64,
-) -> Result<IndexerBatchUpdatedEvent, IpcError> {
-    db.with_writer(|conn| {
-        let tx = conn.transaction()?;
-        let folders = refresh_folders(&tx, source_id)?;
-        tx.commit()?;
-        Ok(IndexerBatchUpdatedEvent {
-            source_id,
-            updated_folder_ids: folders,
-            updated_model_ids: Vec::new(),
-        })
-    })
-}
-
 fn source(tx: &Transaction<'_>, source_id: i64) -> rusqlite::Result<(String, String)> {
     tx.query_row(
         "SELECT root_uri, name FROM sources WHERE id=?1",
@@ -457,6 +591,21 @@ fn local_prefix(root: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+fn source_relative<'a>(root: &str, uri: &'a str) -> rusqlite::Result<&'a str> {
+    if uri == root {
+        return Ok("");
+    }
+    uri.strip_prefix(root)
+        .and_then(|rest| {
+            if root.ends_with('/') {
+                Some(rest)
+            } else {
+                rest.strip_prefix('/')
+            }
+        })
+        .ok_or(rusqlite::Error::InvalidQuery)
+}
+
 fn relative_to<'a>(parent: &str, path: &'a str) -> &'a str {
     if parent.is_empty() {
         path
@@ -475,15 +624,27 @@ fn upsert_folder(
     source_id: i64,
     path: &str,
     name: &str,
+    visible: bool,
 ) -> rusqlite::Result<i64> {
     let parent = (!path.is_empty())
         .then(|| folder_id(tx, source_id, parent_path(path)))
         .transpose()?;
+    if let Some(parent) = parent {
+        // A folder with subdirectories cannot be absorbed as a terminal technical child.
+        reveal_folder(tx, parent)?;
+    }
     tx.prepare_cached(
-        "INSERT INTO folders (source_id, parent_id, rel_path, name) VALUES (?1,?2,?3,?4)
-         ON CONFLICT(source_id, rel_path) DO UPDATE SET parent_id=excluded.parent_id, name=excluded.name
+        "INSERT INTO folders (source_id, parent_id, rel_path, name, is_visible) VALUES (?1,?2,?3,?4,?5)
+         ON CONFLICT(source_id, rel_path) DO UPDATE SET parent_id=excluded.parent_id, name=excluded.name,
+           is_visible=max(folders.is_visible, excluded.is_visible)
          RETURNING id",
-    )?.query_row(params![source_id, parent, path, name], |r| r.get(0))
+    )?.query_row(params![source_id, parent, path, name, visible], |r| r.get(0))
+}
+
+fn reveal_folder(tx: &Transaction<'_>, id: i64) -> rusqlite::Result<()> {
+    tx.prepare_cached("UPDATE folders SET is_visible=1 WHERE id=?1 AND is_visible=0")?
+        .execute([id])?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -515,27 +676,34 @@ fn sync_file_fts(
     path: &str,
     ext: &str,
 ) -> rusqlite::Result<()> {
-    tx.prepare_cached("DELETE FROM files_fts WHERE rowid=?1")?
-        .execute([id])?;
-    tx.prepare_cached("INSERT INTO files_fts (rowid, file_id, model_id, filename, rel_path, ext) VALUES (?1,?1,?2,?3,?4,?5)")?
-        .execute(params![id, model, name, path, ext])?;
+    tx.prepare_cached(
+        "INSERT OR REPLACE INTO files_fts (rowid, file_id, model_id, filename, rel_path, ext)
+         SELECT ?1,?1,?2,?3,?4,?5 WHERE NOT EXISTS (
+           SELECT 1 FROM files_fts WHERE rowid=?1 AND file_id IS ?1 AND model_id IS ?2
+             AND filename IS ?3 AND rel_path IS ?4 AND ext IS ?5)",
+    )?
+    .execute(params![id, model, name, path, ext])?;
     Ok(())
 }
 
 fn sync_model(tx: &Transaction<'_>, root: &str, model: i64) -> rusqlite::Result<()> {
     tx.prepare_cached(
-        "UPDATE models SET (file_count, total_bytes, has_cloud_placeholder, fingerprint) = (
-            SELECT count(*), coalesce(sum(size_bytes),0), coalesce(max(storage_state='cloud_placeholder'),0),
-              CASE WHEN max(storage_state='local_resident') THEN models.fingerprint END
-            FROM files WHERE model_id=?1) WHERE id=?1",
+        "WITH totals(n, bytes, cloud) AS (
+            SELECT count(*), coalesce(sum(size_bytes),0), coalesce(max(storage_state='cloud_placeholder'),0)
+            FROM files WHERE model_id=?1
+         ) UPDATE models SET file_count=n,total_bytes=bytes,has_cloud_placeholder=cloud FROM totals
+         WHERE id=?1 AND (file_count,total_bytes,has_cloud_placeholder) IS NOT (n,bytes,cloud)",
     )?.execute([model])?;
-    tx.prepare_cached("DELETE FROM models_fts WHERE rowid=?1")?
-        .execute([model])?;
     tx.prepare_cached(
-        "INSERT INTO models_fts (rowid, model_id, title, path_tokens, file_tokens)
-         SELECT id,id,display_title || ' ' || raw_name, substr(canonical_uri,length(?2)+1),
-           (SELECT group_concat(rel_path || ' ' || ext, ' ' ORDER BY rel_path, id) FROM files WHERE model_id=?1)
-         FROM models WHERE id=?1",
+        "WITH desired(id, title, path_tokens, file_tokens) AS MATERIALIZED (
+           SELECT id, display_title || ' ' || raw_name, substr(canonical_uri,length(?2)+1),
+             (SELECT group_concat(rel_path || ' ' || ext, ' ' ORDER BY rel_path, id) FROM files WHERE model_id=?1)
+           FROM models WHERE id=?1
+         )
+         INSERT OR REPLACE INTO models_fts (rowid, model_id, title, path_tokens, file_tokens)
+         SELECT id,id,title,path_tokens,file_tokens FROM desired d WHERE NOT EXISTS (
+           SELECT 1 FROM models_fts i WHERE i.rowid=d.id AND i.model_id IS d.id AND i.title IS d.title
+             AND i.path_tokens IS d.path_tokens AND i.file_tokens IS d.file_tokens)",
     )?.execute(params![model, root])?;
     Ok(())
 }
@@ -551,8 +719,8 @@ struct Aggregate {
 }
 
 fn refresh_folders(tx: &Transaction<'_>, source: i64) -> Result<Vec<i64>, IpcError> {
-    let folders = tx.prepare("SELECT id, parent_id FROM folders WHERE source_id=?1 ORDER BY rel_path COLLATE BINARY DESC")?
-        .query_map([source], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+    let folders = tx.prepare("SELECT id, parent_id, is_visible FROM folders WHERE source_id=?1 ORDER BY rel_path COLLATE BINARY DESC")?
+        .query_map([source], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, bool>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
     let mut direct = BTreeMap::<i64, Aggregate>::new();
     let mut stmt = tx.prepare("SELECT folder_id, display_title FROM models WHERE source_id=?1 AND folder_id IS NOT NULL ORDER BY folder_id, display_title COLLATE NOCASE, id")?;
     let mut rows = stmt.query([source])?;
@@ -574,8 +742,10 @@ fn refresh_folders(tx: &Transaction<'_>, source: i64) -> Result<Vec<i64>, IpcErr
     }
     let mut recursive = BTreeMap::<i64, Aggregate>::new();
     let mut update = tx.prepare("UPDATE folders SET model_count=?2,file_count=?3,recursive_model_count=?4,
-        recursive_file_count=?5,nested_folder_count=?6,sample_titles_json=?7,summary_json=?8 WHERE id=?1")?;
-    for &(id, parent) in &folders {
+        recursive_file_count=?5,nested_folder_count=?6,sample_titles_json=?7,summary_json=?8 WHERE id=?1
+        AND (model_count,file_count,recursive_model_count,recursive_file_count,nested_folder_count,sample_titles_json,summary_json)
+        IS NOT (?2,?3,?4,?5,?6,?7,?8)")?;
+    for &(id, parent, visible) in &folders {
         let here = direct.remove(&id).unwrap_or_default();
         let mut tree = recursive.remove(&id).unwrap_or_default();
         let (model_count, file_count) = (here.models, here.files);
@@ -593,11 +763,11 @@ fn refresh_folders(tx: &Transaction<'_>, source: i64) -> Result<Vec<i64>, IpcErr
             summary.to_string()
         ])?;
         if let Some(parent) = parent {
-            tree.folder_count += 1;
+            tree.folder_count += i64::from(visible);
             recursive.entry(parent).or_default().merge(tree);
         }
     }
-    Ok(folders.into_iter().map(|(id, _)| id).collect())
+    Ok(folders.into_iter().map(|(id, _, _)| id).collect())
 }
 
 impl Aggregate {

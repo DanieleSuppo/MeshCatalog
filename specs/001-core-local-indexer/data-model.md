@@ -38,18 +38,18 @@ Rappresenta una cartella radice locale registrata dall'utente in sola lettura (i
 | `root_uri` | `TEXT NOT NULL UNIQUE` | Percorso canonico normalizzato (es. `local://D:/Stampa3D`) |
 | `cursor_token` | `TEXT` | NULL in M1 (usato da Dropbox in M4) |
 | `status` | `TEXT NOT NULL DEFAULT 'idle'` | `CHECK (status IN ('idle', 'scanning', 'unavailable', 'error'))` |
-| `last_error` | `TEXT` | Ultimo errore operativo di accesso radice |
-| `last_scan_at` | `INTEGER` | Unix timestamp (secondi) ultimo completamento scansione |
+| `last_error` | `TEXT` | Riepilogo delle diagnosi dell'ultima scansione, inclusi avvisi recuperabili |
+| `last_scan_at` | `INTEGER` | Unix timestamp (secondi) dell'ultimo completamento; gli avvisi ZIP non lo bloccano |
 | `created_at` | `INTEGER NOT NULL` | Unix timestamp registrazione sorgente |
 
 **Regole di Validazione:**
 - **Prevenzione Sovrapposizioni (FR-003):** Prima di inserire una nuova `local_dir`, il percorso canonico viene normalizzato (case-insensitive su Windows, slash `/` uniformati, rimozione trailing slash). È rifiutata se coincide con una sorgente esistente, è discendente di una sorgente esistente, oppure è antenata di una sorgente esistente.
-- **Protezione Sorgente Irraggiungibile:** Se `root_uri` non è accessibile all'avvio della scansione o al controllo prima del pruning, `status` passa a `'unavailable'`, viene registrato `last_error` e il pruning non viene eseguito. Se fallisce la traversata di un sottoalbero, la scansione prosegue sulle altre cartelle, termina con `status = 'error'` e salta il pruning.
+- **Protezione Sorgente Irraggiungibile:** Se `root_uri` non è accessibile all'avvio o prima della finalizzazione, `status` passa a `'unavailable'`; niente riconciliazione o pruning. Se un sottoalbero è opaco o inaccessibile, il pruning generale è sospeso anche per i file mancanti nelle cartelle osservate. Le cartelle osservate vengono comunque finalizzate: solo uno spostamento confermato può rimuovere i relativi record obsoleti. Symlink e junction esclusi proteggono lo storico al loro percorso, ma non rendono incompleto il raggruppamento delle cartelle osservate né sospendono il pruning altrove. Un errore di traversata imposta `status = 'error'`; un segnaposto opaco o uno ZIP non espandibile produce un avviso.
 
 ---
 
 ### 2.2 `folders` (Nodo Cartella Navigabile)
-Rappresenta una cartella non-tecnica navigabile nella gerarchia della sorgente. Le sottocartelle puramente tecniche assorbite in un `folder_pack` (FR-007 / FR-011) **non** hanno riga in `folders`.
+Rappresenta un nodo fisico della gerarchia. Solo `is_visible = 1` compare nell'albero e in `subfolders`; la ricerca ricorsiva attraversa anche i nodi non visibili. I nuovi candidati tecnici restano nascosti finché risultano assorbiti o separati. Un `.zip`, una sottocartella o lo stato opaco provano che il candidato resta separato. La finalizzazione elimina le righe assorbite quando non hanno più riferimenti; altrimenti rimangono non visibili. Una scansione annullata può lasciare candidati irrisolti fino alla successiva finalizzazione.
 
 | Colonna | Tipo SQLite | Vincoli / Note |
 | :--- | :--- | :--- |
@@ -58,11 +58,12 @@ Rappresenta una cartella non-tecnica navigabile nella gerarchia della sorgente. 
 | `parent_id` | `INTEGER` | `REFERENCES folders(id) ON DELETE CASCADE` (`NULL` per radice sorgente) |
 | `rel_path` | `TEXT NOT NULL` | Path relativo con `/` (`""` per la cartella radice della sorgente) |
 | `name` | `TEXT NOT NULL` | Nome della cartella (per la riga radice `rel_path = ""` coincide con `sources.name`) |
+| `is_visible` | `INTEGER NOT NULL DEFAULT 1` | `CHECK (is_visible IN (0, 1))`; migrazione 003, preserva i nodi v2 come visibili |
 | `model_count` | `INTEGER NOT NULL DEFAULT 0` | Modelli diretti nel livello corrente |
 | `file_count` | `INTEGER NOT NULL DEFAULT 0` | File diretti nel livello corrente (incluse entry `.zip` dei modelli diretti) |
 | `recursive_model_count` | `INTEGER NOT NULL DEFAULT 0` | Totale modelli nell'intero sotto-albero (incluso sé stesso) |
 | `recursive_file_count` | `INTEGER NOT NULL DEFAULT 0` | Totale file nell'intero sotto-albero (incluse entry `.zip`) |
-| `nested_folder_count` | `INTEGER NOT NULL DEFAULT 0` | Numero totale di sottocartelle non-tecniche discendenti nel sotto-albero |
+| `nested_folder_count` | `INTEGER NOT NULL DEFAULT 0` | Numero totale di sottocartelle navigabili discendenti nel sotto-albero |
 | `sample_titles_json` | `TEXT` | Array JSON dei primi 3–4 `display_title` rappresentativi del sotto-albero |
 | `hero_thumb_id` | `INTEGER` | Predisposto per M2 (`NULL` in M1) |
 | `preview_json` | `TEXT` | Predisposto per M3 Smart Folder (`NULL` in M1) |
@@ -94,8 +95,8 @@ Unità logica mostrata nella vista predefinita **Modelli / Pack**.
 
 **Regole di Raggruppamento Deterministiche (FR-007) e `models.folder_id`:**
 1. **`zip_archive`**: ogni file `.zip` rilevato (residente o placeholder), associato al `folder_id` della cartella che lo contiene.
-2. **`folder_pack`**: cartella `P` che contiene (direttamente o tramite sottocartelle tecniche terminali assorbite `STL`, `STLs`, `Presupported`, `Pre-supported`, `Supported`, `Unsupported`, `Images`, `Renders`, `Render`, `Lychee`, `Files`, o scale `32mm`/`75mm`) almeno `2` file 3D/slicer non-`.zip`, oppure `1` file 3D/slicer + `>= 1` immagine supportata. Se `P` è una **cartella foglia** (non è la radice sorgente e non contiene ulteriori sottocartelle non-tecniche né `.zip`), `P` stessa viene rappresentata dal `folder_pack` con `models.folder_id = id(parent(P))` e **non** genera una riga `folders` separata (così navigando `parent(P)` l'utente vede direttamente le card dei modelli invece di cartelle mono-modello). Se invece `P` contiene anche sottocartelle non-tecniche o `.zip` (cartella mista), `P` mantiene la propria riga in `folders` e il pack dei file diretti usa `models.folder_id = id(P)`.
-3. **`single_file`**: singolo file 3D/slicer isolato senza compagni né immagini nella stessa cartella, associato al `folder_id` della cartella che lo contiene.
+2. **`folder_pack`**: cartella `P` con almeno `2` membri 3D/slicer non-`.zip` oppure `1` membro 3D/slicer e `>= 1` immagine. I membri possono provenire da sottocartelle tecniche terminali assorbite come in FR-007. La radice sorgente non assorbe sottocartelle tecniche. Una cartella foglia non tecnica (`P` non è la radice, non ha `.zip` né sottocartelle non assorbite) forma un pack anche con un solo membro 3D/slicer in una sottocartella tecnica assorbita, es. `Boss_Krull/STL/body.stl`. Il modello prende nome e URI da `P`; `models.folder_id = id(parent(P))` e `P` non compare tra le cartelle navigabili. I pack nelle cartelle miste, tecniche non assorbite o radice usano `models.folder_id = id(P)`.
+3. **`single_file`**: singolo file 3D/slicer senza compagni né immagini che non ricade nell'eccezione della foglia; mantiene il nome del file e il `folder_id` del livello logico di raggruppamento. Il caso di un singolo file diretto resta invariato.
 
 ---
 
@@ -173,6 +174,6 @@ CREATE VIRTUAL TABLE files_fts USING fts5(
   - `idx_files_parent_archive ON files(parent_archive_id) WHERE parent_archive_id IS NOT NULL`
 
 ### 2.6 Riconciliazione Spostamenti e Sincronizzazione `FTS5`
-- **Guardia `fingerprint` su placeholder:** Modelli composti solo da `cloud_placeholder` (privi di `content_hash`) mantengono `fingerprint = NULL` e non partecipano al matching per spostamento.
-- **Riconciliazione atomica 1:1:** Durante l'aggiornamento incrementale di una sorgente accessibile, la riconciliazione di spostamento/rinomina viene applicata **solo** quando per uno stesso `fingerprint` non nullo esiste esattamente **1** modello scomparso e **1** nuovo modello apparso nello stesso run (evitando collisioni su copie identiche). In un'unica transazione SQLite atomica, l'eventuale riga provvisoria creata al nuovo `canonical_uri` in Pass 1 viene rimossa (con relativi `files` e voci `FTS5`) prima di aggiornare `canonical_uri`, `folder_id`, `raw_name` e `display_title` sul `models.id` preservato.
-- **Sincronizzazione esplicita `FTS5`:** Poiché `models_fts` e `files_fts` sono tabelle virtuali standalone prive di trigger, ogni inserimento, aggiornamento di percorso/titolo, espansione `.zip` o cancellazione (`remove_source`, pruning orfani) esegue esplicitamente `DELETE` + `INSERT` su `models_fts`/`files_fts` dentro la stessa transazione del writer.
+- **Completezza `fingerprint`:** Un modello osservato riceve un'impronta solo se la composizione è nota e tutti i membri residenti sono stati analizzati. Un pack incompleto conserva l'impronta precedente. I modelli osservati composti solo da `cloud_placeholder` hanno `fingerprint = NULL`.
+- **Riconciliazione atomica 1:1:** Con radice accessibile, il matching richiede un solo modello nuovo e un solo modello certamente scomparso con la stessa impronta verificabile. I modelli con placeholder o membri non osservati non sono candidati. La transazione trasferisce i file di destinazione all'ID storico e aggiorna percorso, cartella, nomi e voci `FTS5`.
+- **Sincronizzazione esplicita `FTS5`:** Il writer inserisce o sostituisce una riga solo se manca o se cambia la proiezione indicizzata, incluso il `model_id` di un file. Le cancellazioni rimuovono esplicitamente le righe FTS nella stessa transazione. Per le ricerche l'app genera un prefisso quotato (`"token"*`) per ciascun token sanitizzato, senza interpretare operatori utente.

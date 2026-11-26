@@ -63,7 +63,7 @@ description: "Actionable, dependency-ordered task list for Milestone M1: Core Lo
 
 ### Implementation for User Story 1
 
-- [X] T015 [P] [US1] Implement `EntryMetadataInspector` trait, `RawWin32AttrFlags`, `OsMetadataInspector` (using `std::fs::symlink_metadata` + `#[cfg(target_os = "windows")] MetadataExt::file_attributes()` without opening read streams), and `MockMetadataInspector` test double in `src-tauri/crates/meshcatalog-core/src/scanner/attr_guard.rs`
+- [X] T015 [P] [US1] Implement `EntryMetadataInspector` trait, `RawWin32AttrFlags`, `OsMetadataInspector` (using Win32 metadata lookup for attributes and reparse tags; `std::fs::symlink_metadata` off Windows), and `MockMetadataInspector` test double in `src-tauri/crates/meshcatalog-core/src/scanner/attr_guard.rs`
 - [X] T016 [P] [US1] Implement case-insensitive system/cache/macOS exclusion rules (`$RECYCLE.BIN`, `System Volume Information`, `.dropbox.cache`, `.git`, `Thumbs.db`, `.DS_Store`, `__MACOSX`, prefix `._*`) and supported extension registry (`stl`, `3mf`, `lys`, `lyt`, `obj`, `ply`, `glb`, `step`, `stp`, `gcode`, `zip`, `jpg`, `jpeg`, `png`, `webp`) in `src-tauri/crates/meshcatalog-core/src/scanner/exclusions.rs`
 - [X] T017 [US1] Implement safe directory walker in `src-tauri/crates/meshcatalog-core/src/scanner/walker.rs` and export scanner module in `src-tauri/crates/meshcatalog-core/src/scanner/mod.rs`. Use `std::fs::read_dir` only after `EntryMetadataInspector` and exclusion checks; `WalkDir` opens directories before invoking its filter, so it cannot enforce that order.
 - [X] T018 [US1] Implement source CRUD (`list_sources`, `add_local_source` with canonical path normalization + ancestor/descendant/exact overlap check returning `IpcError::SourceOverlap`, `remove_source` with `ON DELETE CASCADE`, `mark_source_status`) in `src-tauri/crates/meshcatalog-core/src/db/sources.rs`
@@ -140,8 +140,8 @@ description: "Actionable, dependency-ordered task list for Milestone M1: Core Lo
 ### Implementation for User Story 3
 
 - [X] T041 [P] [US3] Implement streaming `BLAKE3` file hasher (`blake3::Hasher::update_reader` with 64 KB buffer, `(size_bytes, mtime_unix)` skip predicate, and deterministic `Model::fingerprint` returning `None` when no resident member has `content_hash` or hashing sorted member `(content_hash, size_bytes)` otherwise) in `src-tauri/crates/meshcatalog-core/src/hasher/blake3_hasher.rs` and `src-tauri/crates/meshcatalog-core/src/hasher/mod.rs`
-- [X] T042 [US3] Extend `src-tauri/crates/meshcatalog-core/src/db/writer.rs` with incremental file lookup by `uri`/`(size_bytes, mtime_unix)`, atomic 1:1 `fingerprint` move/rename reconciliation (only when `missing.len() == 1 && new.len() == 1` for a non-null `fingerprint`; deleting any provisional Pass 1 destination row first inside the same transaction before updating `canonical_uri`, `folder_id`, `raw_name`, `display_title` on the preserved `models.id`, with explicit `DELETE`+`INSERT` sync of `models_fts`/`files_fts`), and orphan deletion restricted strictly to successfully scanned accessible sources
-- [X] T043 [US3] Integrate Pass 2 parallel `rayon` (`num_cpus.min(8)`) `BLAKE3` hashing for uncached/changed `local_resident` files, `fingerprint` computation, move reconciliation, and orphan pruning into `src-tauri/crates/meshcatalog-core/src/pipeline/mod.rs`
+- [X] T042 [US3] Extend `src-tauri/crates/meshcatalog-core/src/db/writer.rs` with incremental file lookup by `uri`/`(size_bytes, mtime_unix)`, atomic 1:1 `fingerprint` move/rename reconciliation (only when `missing.len() == 1 && new.len() == 1` for a non-null `fingerprint`; deleting any provisional Pass 1 destination row first inside the same transaction before updating `canonical_uri`, `folder_id`, `raw_name`, `display_title` on the preserved `models.id`, with explicit `models_fts`/`files_fts` sync, replacing only changed projections), and orphan deletion restricted strictly to successfully scanned accessible sources
+- [X] T043 [US3] Integrate Pass 2 parallel `rayon` (`num_cpus.min(8)`) `BLAKE3` hashing for uncached/changed `local_resident` files, complete-model `fingerprint` computation, verified move reconciliation on partial walks, and orphan pruning gated on traversal completeness into `src-tauri/crates/meshcatalog-core/src/pipeline/mod.rs`
 
 **Checkpoint**: User Story 3 is complete — unchanged re-scans skip 100% of file hashing, moved/renamed packs and `.zip` archives keep their catalog `id`, and deleted items are pruned safely.
 
@@ -156,7 +156,7 @@ description: "Actionable, dependency-ordered task list for Milestone M1: Core Lo
 - [X] T046 Audit `src-tauri/` and `src/` against Constitution Principles I–V (verify zero writes outside `app_local_data_dir`, zero `File::open` calls bypassing `attr_guard`, zero WebGL/Three.js imports in M1, and alignment with `contracts/tauri-ipc.md`)
 - [ ] T047 On native Windows 10/11 (`x86_64-pc-windows-msvc`), run `cargo check --locked` and `cargo test --locked` for `meshcatalog-app` before the Tauri build and `quickstart.md` Scenarios A, B, and C. Verify native IPC, NTFS junction exclusion, 0 bytes downloaded from authorized `Online-Only` fixtures, `< 60s` first scan on ~40 GB SSD, `< 5s` unchanged rescan, `< 100 ms` search and view-switch, `< 16 ms` scrolling, and read-only integrity. Record results in `specs/001-core-local-indexer/quickstart.md`.
 
-**Evidenza:** [gate WSL2 e audit I–V](./quickstart.md#evidenza-wsl2--t001t046). T013, T021 e T032 sono implementati ma verificati solo staticamente. Attendono il [gate Windows T047](./quickstart.md#t047--aperto-non-eseguito). T039 è verificato con IPC simulato, non nativo.
+**Evidenza:** [gate WSL2 e audit I–V](./quickstart.md#evidenza-wsl2--t001t046). La shell Linux ha superato `cargo check` e i test di servizio. T013, T021 e T032 attendono il [gate Windows T047](./quickstart.md#t047--aperto-verifica-parziale). T039 è verificato con IPC simulato, non nativo.
 
 ---
 
@@ -233,4 +233,4 @@ Task: "T038 [P] [US4] Implement TextInspectorPanel in src/components/TextInspect
 
 - `[P]` tasks target distinct files with no unmet dependencies.
 - All pure-Rust core logic and unit/integration tests live in `src-tauri/crates/meshcatalog-core` so they execute directly in WSL2 (`cargo test -p meshcatalog-core`) without GUI/WebView2 dependencies.
-- Native Windows `x86_64-pc-windows-msvc` testing (`T047`) validates real NTFS `GetFileAttributesExW` / `MetadataExt` placeholder bits and `tauri-plugin-dialog` UX per `quickstart.md`.
+- Native Windows `x86_64-pc-windows-msvc` testing (`T047`) validates real NTFS attributes and reparse tags from Win32 metadata lookups and `tauri-plugin-dialog` UX per `quickstart.md`.

@@ -1,6 +1,6 @@
 //! Background indexing passes.
 
-use std::{fs, io::Seek, path::Path, thread};
+use std::{collections::BTreeSet, fs, io::Seek, path::Path, thread};
 
 use rayon::prelude::*;
 use tokio_util::sync::CancellationToken;
@@ -13,7 +13,7 @@ use crate::{
     },
     db::{
         writer::{
-            cached_analysis, finish_scan, scan_history, write_analysis, write_folder_aggregates,
+            cached_analysis, finish_scan, legacy_root_children, scan_history, write_analysis,
             write_groups, write_inventory_batch, FileAnalysis, ModelHistory,
         },
         Database,
@@ -22,8 +22,8 @@ use crate::{
     hasher::content_hash,
     scanner::{
         attr_guard::{open_resident, EntryMetadata, EntryMetadataInspector},
-        grouping::group,
-        walker::{check_source_directory, walk_inventory, InventoryEntry},
+        grouping::{group, Grouping},
+        walker::{check_source_directory, walk_inventory, InventoryEntry, WalkCoverage},
     },
 };
 
@@ -52,7 +52,7 @@ pub fn run_pass1(
     cancel: &CancellationToken,
     sink: &mut impl PipelineSink,
 ) -> Result<Pass1Stats, IpcError> {
-    run(db, source_id, inspector, cancel, sink, false, |_, _, _| {
+    run(db, source_id, inspector, cancel, sink, |_, _, _| {
         Ok(FinishOutcome::default())
     })
 }
@@ -70,8 +70,7 @@ pub fn run_scan(
         inspector,
         cancel,
         sink,
-        true,
-        |inventory, root, complete_walk| inventory.finish(root, inspector, cancel, complete_walk),
+        |inventory, root, grouped| inventory.finish(root, inspector, cancel, grouped),
     )
 }
 
@@ -81,8 +80,11 @@ fn run<S: PipelineSink>(
     inspector: &impl EntryMetadataInspector,
     cancel: &CancellationToken,
     sink: &mut S,
-    include_metadata: bool,
-    finish: impl FnOnce(&mut Inventory<'_, S>, &Path, bool) -> Result<FinishOutcome, IpcError>,
+    finish: impl FnOnce(
+        &mut Inventory<'_, S>,
+        &Path,
+        GroupedInventory<'_>,
+    ) -> Result<FinishOutcome, IpcError>,
 ) -> Result<Pass1Stats, IpcError> {
     let root = db.local_source_root(source_id)?;
     if cancel.is_cancelled() {
@@ -91,33 +93,45 @@ fn run<S: PipelineSink>(
             ..Pass1Stats::default()
         });
     }
-    let history = include_metadata
-        .then(|| scan_history(db, source_id))
-        .transpose()?;
+    let history = scan_history(db, source_id)?;
     db.mark_source_status(source_id, SourceStatus::Scanning, None, false)?;
     let mut inventory = Inventory {
         db,
         source_id,
         sink,
         entries: Vec::with_capacity(BATCH_SIZE),
-        recorded: include_metadata.then(Vec::new),
-        history,
+        recorded: Vec::new(),
         stats: Pass1Stats::default(),
         current_item: String::new(),
     };
     inventory.progress(0);
     let mut unavailable = false;
-    let mut complete_walk = true;
+    let mut coverage = WalkCoverage::default();
+    let mut opaque = false;
     let mut walk_failed = false;
-    let mut last_error = None;
+    let mut walk_notices = Notices::default();
+    let mut metadata_notices = Notices::default();
     let result = walk_inventory(&root, inspector, cancel, |entry| {
         match entry {
             Ok(entry) => {
                 if let InventoryEntry::File { rel_path, .. } = &entry {
                     inventory.current_item.clone_from(rel_path);
                 }
-                if matches!(entry, InventoryEntry::Directory { opaque: true, .. }) {
-                    complete_walk = false;
+                match &entry {
+                    InventoryEntry::Directory {
+                        rel_path,
+                        opaque: true,
+                        ..
+                    } => {
+                        coverage.exclude(rel_path);
+                        coverage.incomplete = true;
+                        opaque = true;
+                    }
+                    InventoryEntry::UnobservedLink { rel_path } => {
+                        coverage.exclude_link(rel_path);
+                        return Ok(());
+                    }
+                    _ => {}
                 }
                 inventory.entries.push(entry);
                 if inventory.entries.len() == BATCH_SIZE && !cancel.is_cancelled() {
@@ -125,7 +139,17 @@ fn run<S: PipelineSink>(
                 }
             }
             Err(issue) => {
-                complete_walk = false;
+                let mut relative = issue.path.strip_prefix(&root).unwrap_or(Path::new(""));
+                while relative.to_str().is_none() {
+                    relative = relative.parent().unwrap_or(Path::new(""));
+                }
+                coverage.exclude(
+                    &relative
+                        .to_str()
+                        .unwrap_or_default()
+                        .replace(std::path::MAIN_SEPARATOR, "/"),
+                );
+                coverage.incomplete = true;
                 walk_failed = true;
                 let message = if issue.at_root {
                     unavailable = true;
@@ -140,7 +164,7 @@ fn run<S: PipelineSink>(
                     path: Some(issue.path.to_string_lossy().into_owned()),
                     recoverable: true,
                 });
-                last_error = Some(message);
+                walk_notices.push(format!("{}: {message}", issue.path.display()));
             }
         }
         Ok(())
@@ -151,9 +175,34 @@ fn run<S: PipelineSink>(
                 inventory.commit()?;
             }
             if !cancel.is_cancelled() {
-                let outcome = finish(&mut inventory, &root, complete_walk)?;
-                unavailable = outcome.unavailable;
-                last_error = outcome.last_error.or(last_error.take());
+                let recorded = std::mem::take(&mut inventory.recorded);
+                let legacy =
+                    if coverage.incomplete && history.get("").is_some_and(|model| model.pack) {
+                        legacy_root_children(db, source_id)?
+                    } else {
+                        BTreeSet::new()
+                    };
+                let grouping = group(&recorded, &coverage, &legacy, |path| {
+                    history.get(path).is_some_and(|model| model.pack)
+                });
+                inventory.progress(inventory.stats.files_indexed);
+                if !cancel.is_cancelled() {
+                    inventory.sink.batch_updated(write_groups(
+                        db, source_id, &grouping, &recorded, &history,
+                    )?);
+                    inventory.stats.models_indexed = grouping.models.len() as u64;
+                }
+                if !cancel.is_cancelled() {
+                    let grouped = GroupedInventory {
+                        recorded: &recorded,
+                        grouping,
+                        history: &history,
+                        coverage: &coverage,
+                    };
+                    let outcome = finish(&mut inventory, &root, grouped)?;
+                    unavailable = outcome.unavailable;
+                    metadata_notices = outcome.notices;
+                }
             }
         }
         Ok(())
@@ -175,24 +224,54 @@ fn run<S: PipelineSink>(
     } else {
         SourceStatus::Idle
     };
-    let completed =
-        !inventory.stats.cancelled && !unavailable && !walk_failed && last_error.is_none();
-    if completed && !complete_walk {
-        last_error = Some(
+    let completed = !inventory.stats.cancelled && !unavailable && !walk_failed;
+    let mut notices = walk_notices.into_messages();
+    if opaque {
+        notices.push(
             "Scansione parziale: cartelle Online-Only non enumerate; storico conservato.".into(),
         );
     }
+    notices.extend(metadata_notices.into_messages());
+    let last_error = (!notices.is_empty()).then(|| notices.join("\n"));
     db.mark_source_status(source_id, status, last_error.as_deref(), completed)?;
-    if completed && !include_metadata {
-        inventory.progress(inventory.stats.files_indexed);
-    }
     Ok(inventory.stats)
+}
+
+struct GroupedInventory<'a> {
+    recorded: &'a [InventoryEntry],
+    grouping: Grouping<'a>,
+    history: &'a ModelHistory,
+    coverage: &'a WalkCoverage,
 }
 
 #[derive(Default)]
 struct FinishOutcome {
     unavailable: bool,
-    last_error: Option<String>,
+    notices: Notices,
+}
+
+#[derive(Default)]
+struct Notices {
+    messages: Vec<String>,
+    omitted: usize,
+}
+
+impl Notices {
+    fn push(&mut self, message: String) {
+        if self.messages.len() < 4 {
+            self.messages.push(message);
+        } else {
+            self.omitted += 1;
+        }
+    }
+
+    fn into_messages(mut self) -> Vec<String> {
+        if self.omitted > 0 {
+            self.messages
+                .push(format!("Altri avvisi: {}", self.omitted));
+        }
+        self.messages
+    }
 }
 
 struct Inventory<'a, S> {
@@ -200,8 +279,7 @@ struct Inventory<'a, S> {
     source_id: i64,
     sink: &'a mut S,
     entries: Vec<InventoryEntry>,
-    recorded: Option<Vec<InventoryEntry>>,
-    history: Option<ModelHistory>,
+    recorded: Vec<InventoryEntry>,
     stats: Pass1Stats,
     current_item: String,
 }
@@ -215,11 +293,7 @@ impl<S: PipelineSink> Inventory<'_, S> {
             .filter(|entry| matches!(entry, InventoryEntry::File { .. }))
             .count() as u64;
         self.stats.models_indexed += batch.updated_model_ids.len() as u64;
-        if let Some(recorded) = &mut self.recorded {
-            recorded.append(&mut self.entries);
-        } else {
-            self.entries.clear();
-        }
+        self.recorded.append(&mut self.entries);
         self.sink.batch_updated(batch);
         self.progress(0); // A streaming walk only knows the total when it finishes.
         Ok(())
@@ -230,19 +304,14 @@ impl<S: PipelineSink> Inventory<'_, S> {
         root: &Path,
         inspector: &(impl EntryMetadataInspector + Sync),
         cancel: &CancellationToken,
-        complete_walk: bool,
+        GroupedInventory {
+            recorded,
+            grouping,
+            history,
+            coverage,
+        }: GroupedInventory<'_>,
     ) -> Result<FinishOutcome, IpcError> {
         let mut outcome = FinishOutcome::default();
-        let recorded = self.recorded.take().expect("full inventory enabled");
-        let history = self.history.take().expect("full inventory history enabled");
-        let grouping = group(&recorded);
-        self.progress(self.stats.files_indexed);
-        if cancel.is_cancelled() {
-            return Ok(outcome);
-        }
-        self.sink
-            .batch_updated(write_groups(self.db, self.source_id, &grouping)?);
-        self.stats.models_indexed = grouping.models.len() as u64;
         let cached = cached_analysis(self.db, self.source_id)?;
         let files: Vec<_> = recorded
             .iter()
@@ -271,7 +340,6 @@ impl<S: PipelineSink> Inventory<'_, S> {
         let total = files.len() as u64;
         let mut processed = 0;
         self.metadata_progress(processed, total, "");
-        let mut zip_changed = false;
         if !files.is_empty() && !cancel.is_cancelled() {
             let workers = thread::available_parallelism().map_or(1, |n| n.get().min(8));
             let pool = rayon::ThreadPoolBuilder::new()
@@ -306,16 +374,16 @@ impl<S: PipelineSink> Inventory<'_, S> {
                     rows += 1 + result.zip.as_ref().map_or(0, Vec::len);
                     updates.push(result);
                     if rows >= BATCH_SIZE && !cancel.is_cancelled() {
-                        zip_changed |= self.flush_analysis(&mut updates)?;
+                        self.flush_analysis(&mut updates)?;
                         rows = 0;
                     }
                 }
             }
             if !updates.is_empty() && !cancel.is_cancelled() {
-                zip_changed |= self.flush_analysis(&mut updates)?;
+                self.flush_analysis(&mut updates)?;
             }
         }
-        if !cancel.is_cancelled() && complete_walk {
+        if !cancel.is_cancelled() {
             // Recheck availability before interpreting unobserved paths as deletions.
             if let Err(error) =
                 check_source_directory(root, inspector).and_then(|()| fs::read_dir(root))
@@ -331,21 +399,17 @@ impl<S: PipelineSink> Inventory<'_, S> {
                 self.sink.batch_updated(finish_scan(
                     self.db,
                     self.source_id,
-                    &recorded,
+                    recorded,
                     &grouping,
-                    &history,
+                    history,
+                    coverage,
                 )?);
-                zip_changed = false;
             }
-        }
-        if zip_changed {
-            self.sink
-                .batch_updated(write_folder_aggregates(self.db, self.source_id)?);
         }
         Ok(outcome)
     }
 
-    fn flush_analysis(&mut self, updates: &mut Vec<FileAnalysis<'_>>) -> Result<bool, IpcError> {
+    fn flush_analysis(&mut self, updates: &mut Vec<FileAnalysis<'_>>) -> Result<(), IpcError> {
         let event = write_analysis(self.db, self.source_id, updates)?;
         self.stats.files_indexed += updates
             .iter()
@@ -353,11 +417,10 @@ impl<S: PipelineSink> Inventory<'_, S> {
             .map(|entries| entries.len() as u64)
             .sum::<u64>();
         updates.clear();
-        let visible_change = !event.updated_model_ids.is_empty();
-        if visible_change {
+        if !event.updated_model_ids.is_empty() {
             self.sink.batch_updated(event);
         }
-        Ok(visible_change)
+        Ok(())
     }
 
     fn report_error(
@@ -374,7 +437,9 @@ impl<S: PipelineSink> Inventory<'_, S> {
             path: Some(root.join(path).to_string_lossy().into_owned()),
             recoverable: true,
         });
-        outcome.last_error = Some(message);
+        outcome
+            .notices
+            .push(format!("{}: {message}", root.join(path).display()));
     }
 
     fn metadata_progress(&mut self, processed: u64, total: u64, path: &str) {
@@ -412,10 +477,11 @@ fn analyze<'a>(
     let mut result = FileAnalysis {
         path,
         hash: None,
-        zip: zip.then(Vec::new),
+        zip: None,
         complete: false,
     };
     if metadata.flags.is_placeholder() {
+        result.zip = zip.then(Vec::new);
         return (result, None);
     }
     let analysis = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -425,7 +491,13 @@ fn analyze<'a>(
         }
         if zip {
             file.rewind()?;
-            result.zip = Some(read_zip_directory(file)?);
+            match read_zip_directory(file) {
+                Ok(entries) => result.zip = Some(entries),
+                Err(error) => {
+                    result.zip = Some(Vec::new());
+                    return Err(error.into());
+                }
+            }
         }
         result.complete = true;
         Ok(())

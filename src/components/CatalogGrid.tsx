@@ -10,13 +10,14 @@ import { ModelOrFileCard } from './ModelOrFileCard';
 interface GridProps {
   query: SearchQuery;
   firstPage: SearchResultPage;
+  revision: number;
   onOpen: (folder: FolderCardDto) => void;
   onInspect: (modelId: number, itemId: number) => void;
   selectedItemId: number | null;
 }
 
 // Folder roots have recursive totals but deliberately return no direct items.
-export function CatalogGrid({ query, firstPage, onOpen, onInspect, selectedItemId }: GridProps) {
+export function CatalogGrid({ query, firstPage, revision, onOpen, onInspect, selectedItemId }: GridProps) {
   const viewport = useRef<HTMLDivElement>(null);
   const [columns, setColumns] = useState(1);
   useEffect(() => {
@@ -36,6 +37,15 @@ export function CatalogGrid({ query, firstPage, onOpen, onInspect, selectedItemI
   const rowCount = itemHeader + (count ? 1 + Math.ceil(count / columns) : 0);
   const rowHeight = (i: number) => i === 0 || i === itemHeader ? 42 : i < itemHeader ? 220 : 158;
   const rows = useVirtualizer({ count: rowCount, getScrollElement: () => viewport.current, estimateSize: rowHeight, overscan: 2 });
+  // Reset scroll only when navigation criteria change (folder, source/filter, view mode, text).
+  // Refresh (revision/firstPage) and pagination (offset pages) must keep the position.
+  const criteriaKey = `${query.text}\0${query.viewMode}\0${query.sourceFilter}\0${query.sourceId ?? ''}\0${query.folderId ?? ''}`;
+  useEffect(() => {
+    viewport.current?.scrollTo?.({ top: 0 });
+    // scrollTo may be unavailable in test DOM; scrollTop assignment is the observable contract.
+    if (viewport.current) viewport.current.scrollTop = 0;
+    rows.scrollToIndex(0, { align: 'start' });
+  }, [criteriaKey, rows]);
   // Some row indices change kind (heading / folder / item) when the width or inventory changes.
   useEffect(() => rows.measure(), [rows, columns, itemHeader]);
   const visible = rows.getVirtualItems();
@@ -44,7 +54,8 @@ export function CatalogGrid({ query, firstPage, onOpen, onInspect, selectedItemI
   const startPage = Math.max(1, Math.floor(first / query.limit));
   const endPage = Math.floor(last / query.limit);
   type Items = SearchResultPage['items'];
-  const cache = useMemo(() => new Map<number, { request: Promise<Items>; items?: Items }>(), [query, firstPage]);
+  // A committed batch invalidates cached pages, not the scroll position.
+  const cache = useMemo(() => new Map<number, { request: Promise<Items>; items?: Items }>(), [query, revision]);
   const loadWindow = useCallback(async () => {
     // Keep only intersecting pages. Reuse the shared edge (including an in-flight read) when scrolling.
     for (const p of cache.keys()) if (p < startPage || p > endPage) cache.delete(p);

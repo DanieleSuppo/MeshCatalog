@@ -1,8 +1,185 @@
 mod common;
 
 use common::{Events, Fixture};
-use meshcatalog_core::{pipeline::run_scan, scanner::attr_guard::OsMetadataInspector};
+use meshcatalog_core::{
+    contracts::{
+        IndexerBatchUpdatedEvent, IndexerErrorEvent, IndexerProgressEvent, SearchQuery,
+        SourceFilter, ViewMode,
+    },
+    db::Database,
+    pipeline::{run_pass1, run_scan, PipelineSink},
+    scanner::attr_guard::OsMetadataInspector,
+};
 use tokio_util::sync::CancellationToken;
+
+#[test]
+fn root_keeps_technical_children_even_with_loose_files() {
+    let f = Fixture::new();
+    f.file("STL/root.stl", b"a");
+    for path in ["README.md", "loose.stl"] {
+        f.file(path, b"b");
+        run_scan(
+            &f.db,
+            f.source,
+            &OsMetadataInspector,
+            &CancellationToken::new(),
+            &mut Events::default(),
+        )
+        .unwrap();
+        let tree = f.db.get_folder_tree(SourceFilter::All).unwrap();
+        assert_eq!(tree[0].children[0].rel_path, "STL", "with {path}");
+        f.db.with_reader(|db| {
+            let title: String = db.query_row("SELECT display_title FROM models m JOIN folders f ON f.id=m.folder_id WHERE f.rel_path='STL'", [], |r| r.get(0))?;
+            assert_eq!(title, "root");
+            Ok(())
+        }).unwrap();
+    }
+}
+
+#[test]
+fn only_a_leaf_with_an_indirect_single_member_takes_the_folder_name() {
+    let f = Fixture::new();
+    for path in [
+        "Boss_Krull/STL/body.stl",
+        "Direct/body.stl",
+        "Mixed/STL/body.stl",
+        "Mixed/Other/part.stl",
+        "Zipped/STL/body.stl",
+        "Zipped/bonus.zip",
+    ] {
+        f.file(path, b"x");
+    }
+    run_scan(
+        &f.db,
+        f.source,
+        &OsMetadataInspector,
+        &CancellationToken::new(),
+        &mut Events::default(),
+    )
+    .unwrap();
+    let tree = f.db.get_folder_tree(SourceFilter::All).unwrap();
+    assert_eq!(
+        tree[0]
+            .children
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect::<Vec<_>>(),
+        ["Direct", "Mixed", "Zipped"]
+    );
+    f.db.with_reader(|db| {
+        let mut stmt = db.prepare("SELECT m.display_title,m.container_kind,f.rel_path FROM models m JOIN folders f ON f.id=m.folder_id ORDER BY 1,3")?;
+        let models = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<Result<Vec<_>,_>>()?;
+        assert_eq!(models, [("Boss Krull", "folder_pack", ""), ("body", "single_file", "Direct"), ("body", "single_file", "Mixed"), ("body", "single_file", "Zipped"), ("bonus", "zip_archive", "Zipped"), ("part", "single_file", "Mixed/Other")].map(|(title,kind,folder)|(title.to_owned(),kind.to_owned(),folder.to_owned())));
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+fn completed_pass1_drops_empty_provisional_models() {
+    let f = Fixture::new();
+    f.file("Boss_Krull/STL/body.stl", b"mesh");
+    run_pass1(
+        &f.db,
+        f.source,
+        &OsMetadataInspector,
+        &CancellationToken::new(),
+        &mut Events::default(),
+    )
+    .unwrap();
+    assert_eq!(f.db.list_sources().unwrap()[0].model_count, 1);
+}
+
+#[test]
+fn mid_inventory_batches_keep_technical_files_searchable_without_provisional_folders() {
+    struct Observe<'a> {
+        db: &'a Database,
+        batches: usize,
+        first_scan: bool,
+    }
+    impl PipelineSink for Observe<'_> {
+        fn progress(&mut self, _: IndexerProgressEvent) {}
+        fn error(&mut self, e: IndexerErrorEvent) {
+            panic!("{}", e.message);
+        }
+        fn batch_updated(&mut self, _: IndexerBatchUpdatedEvent) {
+            self.batches += 1;
+            let query = |text: &str, folder_id| SearchQuery {
+                text: text.into(),
+                view_mode: ViewMode::Files,
+                source_filter: SourceFilter::All,
+                source_id: None,
+                folder_id,
+                facets: Default::default(),
+                limit: 10,
+                offset: 0,
+            };
+            let tree = self.db.get_folder_tree(SourceFilter::All).unwrap();
+            fn contains(nodes: &[meshcatalog_core::contracts::FolderTreeNode], path: &str) -> bool {
+                nodes
+                    .iter()
+                    .any(|f| f.rel_path == path || contains(&f.children, path))
+            }
+            assert!(!contains(&tree, "Pack/STL"));
+            if let Some(pack) = tree[0].children.iter().find(|dir| dir.rel_path == "Pack") {
+                let browse = self.db.search_catalog(&query("", Some(pack.id))).unwrap();
+                assert!(browse.subfolders.iter().all(|dir| dir.name != "STL"));
+            }
+            let page = self
+                .db
+                .search_catalog(&query("Mesh", Some(tree[0].id)))
+                .unwrap();
+            assert!(page.total_files > 0);
+            if self.first_scan && self.batches == 1 {
+                assert!(page.total_files < 510);
+            }
+            assert!(page.items.iter().all(|item| matches!(item,
+                meshcatalog_core::contracts::SearchItemDto::File(file)
+                    if file.rel_path.starts_with("Pack/STL/Mesh"))));
+            if self
+                .db
+                .search_catalog(&query("zip", None))
+                .unwrap()
+                .total_files
+                > 0
+            {
+                assert!(contains(&tree, "Misc/Images"));
+            }
+        }
+    }
+    let f = Fixture::new();
+    for i in 0..510 {
+        f.file(&format!("Pack/STL/Mesh{i}.stl"), b"a");
+    }
+    // A valid, empty ZIP makes Images non-absorbable without a metadata error.
+    f.file(
+        "Misc/Images/separate.zip",
+        b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+    );
+    f.file("Lonely/Images/cover.png", b"image without a model");
+    for first_scan in [true, false] {
+        let mut sink = Observe {
+            db: &f.db,
+            batches: 0,
+            first_scan,
+        };
+        run_scan(
+            &f.db,
+            f.source,
+            &OsMetadataInspector,
+            &CancellationToken::new(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(sink.batches > 2);
+        let tree = f.db.get_folder_tree(SourceFilter::All).unwrap();
+        let lonely = tree[0]
+            .children
+            .iter()
+            .find(|folder| folder.rel_path == "Lonely")
+            .unwrap();
+        assert_eq!(lonely.children[0].rel_path, "Lonely/Images");
+    }
+}
 
 #[test]
 fn title_cleanup_removes_decimal_scales_and_ratios_without_changing_hyphenated_names() {

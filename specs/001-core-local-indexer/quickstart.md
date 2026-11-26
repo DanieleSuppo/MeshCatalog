@@ -11,7 +11,7 @@ Questa guida descrive i prerequisiti e gli scenari verificabili end-to-end per v
 
 ### Su WSL2 (Authoring, Logic Unit & Integration Tests)
 - **Rust stable** (`rustup`, `cargo`, `rustc`) — *nota: installare `rustup` in WSL2 se non ancora presente nel `PATH`.*
-- **Node.js >= 18 LTS** (`v18.15.0+` / `npm 9+`) per type-check e build frontend (`npm run build`).
+- **Node.js 22 LTS** (`>=22.12.0` / `npm 10+`, verificato `v22.23.2` / `npm 10.9.8` in WSL2) per type-check e build frontend (`npm run build`).
 - Nessuna libreria grafica Linux o WebView2 richiesta per testare `meshcatalog-core`.
 
 ### Su Windows 10/11 (Native Win32 Guard, Tauri Shell & 40 GB / Smart Sync Benchmark)
@@ -28,14 +28,14 @@ Questa guida descrive i prerequisiti e gli scenari verificabili end-to-end per v
    cargo test --locked --manifest-path src-tauri/Cargo.toml -p meshcatalog-core
    ```
    **Esiti attesi (tutti verdi):**
-   - **Win32 Anti-Hydration Guard (mocked attribute bitmask):** file marcati `0x0040_0000` (`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`) o `0x0000_1000` (`FILE_ATTRIBUTE_OFFLINE`) vengono classificati `cloud_placeholder` senza mai tentare aperture dati né decompressione `.zip`.
+   - **Win32 Anti-Hydration Guard (attributi e tag simulati):** i bit recall/offline impediscono aperture dati o enumerazione. I tag della famiglia `CLOUD` senza recall/offline autorizzano l'accesso residente; tag sconosciuti, name surrogate ed errori di lookup lo bloccano.
    - **Esclusioni & Symlink:** directory/file `$RECYCLE.BIN`, `System Volume Information`, `.dropbox.cache`, `.git`, `Thumbs.db`, `.DS_Store`, `__MACOSX/`, `._*` (sia su disco sia dentro `.zip`) e symlink/junction di directory non vengono attraversati né catalogati, anche se il tipo Win32 non è riportato come symlink.
    - **Raggruppamento Modelli/Pack & Pulizia Titoli:**
      - `.zip` multi-file $\rightarrow$ `zip_archive` con `zip_entry` accurate e zero file estratti su disco.
-     - `.zip` corrotto/cifrato $\rightarrow$ avviso recuperabile, archivio catalogato comunque senza bloccare la scansione.
+     - `.zip` corrotto/cifrato $\rightarrow$ archivio catalogato senza espansione; avviso recuperabile conservato anche con altre diagnosi e `last_scan_at` aggiornato.
      - Cartella con sottocartelle tecniche terminali (`STL/`, `Presupported/`, `32mm/`, `Images/`) $\rightarrow$ accorpata in un solo `folder_pack` padre; le sottocartelle tecniche non appaiono nell'albero navigabile.
      - File 3D isolato $\rightarrow$ `single_file`.
-   - **Incrementale & Move Resilience:** ri-scansione su dataset invariato salta il 100% degli hash `BLAKE3`; spostamento/rinomina di `folder_pack` e `.zip` conserva `models.id` e aggiorna `canonical_uri` senza duplicati; cancellazione rimuove i record orfani; sorgente inaccessibile mantiene intatti i record storici.
+   - **Incrementale & Move Resilience:** ri-scansione su dataset invariato salta il 100% degli hash `BLAKE3`; spostamento/rinomina di `folder_pack` e `.zip` conserva `models.id` e aggiorna `canonical_uri` senza duplicati; una scansione completa rimuove gli orfani. Con un sottoalbero opaco o inaccessibile, la rinomina certa di un modello osservato conserva l'ID senza rimuovere lo storico non osservato.
    - **Benchmark SQLite FTS5 (`50.000+` record):** test automatizzato che inserisce 50k+ voci e verifica latenza di `search_catalog` (vista `models` e `files`, con e senza filtro ricorsivo `folder_id`) **< 100 ms**.
 
 2. **Verifica Frontend TypeScript & Vite build:**
@@ -48,22 +48,22 @@ Questa guida descrive i prerequisiti e gli scenari verificabili end-to-end per v
 
 ### Evidenza WSL2 — T001–T046
 
-Le voci T013, T021 e T032 hanno solo evidenza statica. Restano aperte in attesa della compilazione, dei test e della verifica IPC in T047.
+I gate Windows T013, T021 e T032 restano aperti. I test della shell Tauri Linux verificano il servizio, non WebView2 o l'IPC nativo.
 
 | Task | Evidenza verificata in WSL2 |
 | --- | --- |
 | T001–T013 | Manifest, shell e registrazione IPC ispezionati; test di migrazione, WAL/FTS5, reader in sola lettura, DTO Rust/TS e build Vite verdi. |
-| T014–T022 | Test con attributi Win32 simulati, esclusioni, guardia prima delle aperture, CRUD, annullamento Pass 1 e test sidebar/comandi verdi. Orchestrazione Tauri verificata staticamente. |
-| T023–T029 | Test di grouping, immagini non associate, Central Directory ZIP (inclusi archivi corrotti e cifrati), FTS e conteggi cartelle verdi. |
-| T030–T039 | Test SQLite sintetico da oltre 50.000 record sotto 100 ms; test UI con IPC simulato per ricerca, paginazione, navigazione e Inspector verdi. |
-| T040–T043 | Test locali revisionati con ciclo rosso/verde: zero aperture per hash invariati, ri-hash al cambio di dimensione o mtime, ID pack/ZIP stabili, fingerprint ambigui/nulli, pruning e ritenzione dello storico. |
-| T044–T046 | `cargo fmt --check`, `cargo check` core, `cargo clippy -p meshcatalog-core --all-targets -- -D warnings`, 29 test Rust con `--locked`, `npm ci`, `npm run build` e 9 test frontend superati. Audit statico I–V sotto. |
+| T014–T022 | Test core con attributi Win32 simulati, esclusioni, guardia prima delle aperture, CRUD e annullamento Pass 1. Tre test `ScannerService` eseguiti nella shell Tauri Linux, incluso rimozione/re-add di una sorgente accodata con la prima scansione bloccata. |
+| T023–T029 | Test di grouping e visibilità a metà Pass 1 (file ricercabili, nodi tecnici provvisori nascosti), immagini non associate, ZIP corrotti/cifrati, FTS e conteggi cartelle. |
+| T030–T039 | Ricerca SQLite sintetica su 50.010 righe per vista: massimo 38,96 ms (prefissi, entrambe le viste, scope globale e ricorsivo); test UI con IPC simulato per ricerca, paginazione, navigazione e Inspector. |
+| T040–T043 | Test locali rosso/verde: zero riletture dei file invariati, ownership/titoli FTS aggiornati dopo rinomina, ID pack/ZIP stabili, fingerprint ambigui/nulli, pruning e ritenzione dello storico. Ri-scansione sintetica di 2.002 file: riscritture FTS 8.026 → 0; 280 ms → 112 ms in due run WSL2, non benchmark SSD da 40 GB. |
+| T044–T046 | `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`; 43 test core e 3 test shell Linux con `--locked`. `npm run build` e 10 test frontend verdi. Audit I–V sotto. |
 
 - **I — Scritture:** bootstrap e SQLite scrivono nella directory dati dell'app. `temp_store=MEMORY` su writer e reader evita file temporanei SQLite nel percorso temporaneo di sistema. Nessuna estrazione ZIP o scrittura nei percorsi utente.
 - **II — Anti-idratazione:** hashing e Central Directory condividono un'unica apertura in sola lettura, successiva al controllo degli attributi di directory e file. Nessun accesso a dati Dropbox reali; i test WSL simulano gli attributi, non l'idratazione NTFS.
 - **III — Browsing:** reader SQLite separati e griglia virtualizzata. Nessun pacchetto WebGL/Three.js nel manifest, albero npm, sorgenti o bundle controllati. I test browser sintetici non misurano il frame time WebView2.
 - **IV — Tassonomia:** nessun configuratore; grouping e pulizia titoli deterministici. La riconciliazione conserva la riga modello, trasferisce i file di destinazione e riallinea entrambe le tabelle FTS5.
-- **V — Cross-OS:** nessun nuovo parser o SDK proprietario. I nomi, i payload e il wiring IPC sono allineati staticamente al contratto. Il controllo opzionale `cargo check -p meshcatalog-app` su WSL2 è bloccato dalle librerie native mancanti `libsoup-3.0`, `javascriptcoregtk-4.1`, `webkit2gtk-4.1`; i gate WSL2 obbligatori riguardano core e frontend.
+- **V — Cross-OS:** nessun nuovo parser o SDK proprietario. I nomi, i payload e il wiring IPC sono allineati staticamente al contratto. La shell Linux (`cargo check` e `cargo test -p meshcatalog-app`) è stata verificata usando un sysroot locale con GTK/WebKitGTK. Questo non prova la build MSVC, WebView2, il dialog o l'IPC end-to-end.
 
 ---
 
@@ -100,13 +100,13 @@ npm run tauri -- dev --target x86_64-pc-windows-msvc -- --locked
 2. Spostare/rinominare una cartella pack e un archivio `.zip` in Esplora File di Windows, quindi rilanciare `Scansiona`: verificare l'aggiornamento del percorso canonico senza voci duplicate nel catalogo.
 3. Rimuovere la sorgente dalla UI e verificare che i record spariscano dal DB mentre i file reali su SSD restano intatti.
 
-M1 non segue reparse point, nemmeno negli antenati della sorgente. Per un volume NTFS montato in una cartella usare la lettera di unità diretta, se disponibile. In Scenario A verificare che una sorgente attraverso un mount point venga rifiutata senza accesso ai dati. Se una sottocartella è Online-Only, la scansione termina con un avviso: il contenuto non viene enumerato e lo storico non viene eliminato.
+M1 permette solo reparse point riconosciuti della famiglia `CLOUD` e residenti, anche negli antenati. Per un volume NTFS montato in una cartella usare la lettera di unità diretta, se disponibile. In Scenario A verificare che una sorgente attraverso un mount point venga rifiutata senza accesso ai dati. Verificare inoltre che una sottocartella Online-Only non venga enumerata e che il suo storico rimanga intatto.
 
-### T047 — Aperto, non eseguito
+### T047 — Aperto, verifica parziale
 
-Mancano una sessione Windows nativa di verifica e una fixture autorizzata (~40 GB SSD e segnaposto Online-Only). Non è stato aperto alcun dato Dropbox reale. Restano da provare:
+Una revisione precedente della suite `meshcatalog-core`, compilata da WSL2 per `x86_64-pc-windows-msvc`, è stata eseguita in Windows (35 test verdi), inclusa una junction NTFS nativa in una directory temporanea. I tag `CLOUD` e i bit di richiamo sono simulati. Non è stato aperto alcun dato Dropbox reale. Restano da provare:
 
-- **Compilazione e test MSVC:** `cargo check --locked` e `cargo test --locked` per `meshcatalog-app`, inclusi i due test di `ScannerService` sulla concorrenza e sulla sorgente non disponibile.
+- **Compilazione e test MSVC:** `cargo check --locked` e `cargo test --locked` per `meshcatalog-app`, inclusi i tre test di `ScannerService`; rieseguire anche la suite core aggiornata.
 - **Avvio WebView2:** build Tauri da lockfile, dialog nativo e IPC end-to-end.
 - **Scenario A:** attributi Win32 effettivi, zero aperture dati e **0 byte** scaricati dai segnaposto; integrità read-only e scritture confinate a `%LOCALAPPDATA%\MeshCatalog`. Per la junction, usare una fixture NTFS locale separata e verificare che i file visibili solo dalla junction non entrino nel catalogo.
 - **Scenario B:** prima scansione **< 60 s**, ricerca e cambio vista **< 100 ms**, scorrimento **< 16 ms** in WebView2 durante la scansione; navigazione e Inspector tramite IPC nativo.

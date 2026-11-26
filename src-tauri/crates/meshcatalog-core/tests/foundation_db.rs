@@ -60,7 +60,7 @@ fn database_reopens_without_losing_data_and_readers_cannot_write() {
     let db = Database::open(&path).unwrap();
     db.with_writer(|writer| {
         assert_eq!(writer.pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))?, "wal");
-        for (pragma, value) in [("foreign_keys", 1), ("synchronous", 1), ("busy_timeout", 5000), ("temp_store", 2), ("user_version", 2)] {
+        for (pragma, value) in [("foreign_keys", 1), ("synchronous", 1), ("busy_timeout", 5000), ("temp_store", 2), ("user_version", 3)] {
             assert_eq!(writer.pragma_query_value(None, pragma, |r| r.get::<_, i64>(0))?, value);
         }
         let tx = writer.transaction()?;
@@ -116,6 +116,7 @@ fn upgrades_v1_preserving_archive_relationships_identities_fts_and_overrides() {
     db.with_writer(|c| {
         assert_eq!(c.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0))?, 0);
         for sql in [
+            "SELECT count(*) FROM folders WHERE id=7 AND is_visible=1",
             "SELECT count(*) FROM files WHERE id=22 AND parent_archive_id=21 AND model_id=11 AND folder_id=7 AND zip_entry_method=8 AND zip_entry_csize=4",
             "SELECT count(*) FROM files_fts WHERE files_fts MATCH 'mesh' AND rowid=22",
             "SELECT count(*) FROM models_fts WHERE models_fts MATCH 'archive' AND rowid=11",

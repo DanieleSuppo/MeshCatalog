@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, ReadDir},
     io,
     path::{Path, PathBuf},
@@ -25,9 +26,64 @@ pub(crate) enum InventoryEntry {
         ext: String,
         metadata: EntryMetadata,
     },
-    OtherFile {
-        parent: String,
+    UnobservedLink {
+        rel_path: String,
     },
+}
+
+#[derive(Default)]
+pub(crate) struct WalkCoverage {
+    gaps: BTreeSet<String>,
+    // Intentionally skipped links protect historical rows without making grouping incomplete.
+    skipped_links: BTreeSet<String>,
+    pub incomplete: bool,
+}
+
+impl WalkCoverage {
+    pub fn exclude(&mut self, path: &str) {
+        self.gaps.insert(Self::key(path));
+    }
+
+    pub fn exclude_link(&mut self, path: &str) {
+        self.skipped_links.insert(Self::key(path));
+    }
+
+    pub fn unobserved(&self, path: &str) -> bool {
+        Self::contains_path(&self.gaps, path)
+    }
+
+    pub fn protects_history(&self, path: &str) -> bool {
+        self.unobserved(path) || Self::contains_path(&self.skipped_links, path)
+    }
+
+    fn contains_path(paths: &BTreeSet<String>, path: &str) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        let key = Self::key(path);
+        let mut path = key.as_str();
+        loop {
+            if paths.contains(path) {
+                return true;
+            }
+            if path.is_empty() {
+                return false;
+            }
+            path = super::grouping::parent_path(path);
+        }
+    }
+
+    pub fn gaps(&self) -> impl Iterator<Item = &str> {
+        self.gaps.iter().map(String::as_str)
+    }
+
+    pub fn key(path: &str) -> String {
+        if cfg!(windows) {
+            path.to_uppercase()
+        } else {
+            path.to_owned()
+        }
+    }
 }
 
 pub(crate) struct WalkIssue {
@@ -119,20 +175,27 @@ fn walk(
                 continue;
             }
         };
-        if metadata.flags.is_symlink {
-            continue;
-        }
         let rel_path = if parent_rel.is_empty() {
             name.to_owned()
         } else {
             format!("{parent_rel}/{name}")
         };
+        let opaque = metadata.flags.is_placeholder();
+        if metadata.flags.is_link() {
+            visit(Ok(InventoryEntry::UnobservedLink { rel_path }))?;
+            continue;
+        }
+        if !opaque && !metadata.flags.allows_resident_access() {
+            visit(issue(
+                &path,
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Reparse point non riconosciuto",
+                ),
+            ))?;
+            continue;
+        }
         if metadata.is_dir {
-            let opaque = metadata.flags.is_placeholder();
-            // A junction can have the reparse bit without being reported as a symlink.
-            if metadata.flags.is_reparse_point() && !opaque {
-                continue;
-            }
             visit(Ok(InventoryEntry::Directory {
                 rel_path: rel_path.clone(),
                 name: name.to_owned(),
@@ -140,7 +203,7 @@ fn walk(
             }))?;
             // WalkDir opens directories before its filter runs; gate enumeration here instead.
             if !opaque {
-                match read_directory(&path) {
+                match check_directory(&path, inspector).and_then(|()| read_directory(&path)) {
                     Ok(entries) => stack.push((path, rel_path, entries)),
                     Err(error) => visit(issue(&path, error))?,
                 }
@@ -152,10 +215,6 @@ fn walk(
                     name: name.to_owned(),
                     ext,
                     metadata,
-                }))?;
-            } else if parent_rel.is_empty() {
-                visit(Ok(InventoryEntry::OtherFile {
-                    parent: parent_rel.clone(),
                 }))?;
             }
         }
@@ -190,6 +249,7 @@ mod tests {
             "placeholder",
             "symlink",
             "junction",
+            "unknown",
             "resident",
         ] {
             fs::create_dir(root.join(name)).unwrap();
@@ -200,6 +260,7 @@ mod tests {
                 RawWin32AttrFlags {
                     file_attributes: 0x0040_0400,
                     is_symlink: false,
+                    reparse_tag: Some(0x9000_001a),
                 },
             ),
             (
@@ -207,6 +268,7 @@ mod tests {
                 RawWin32AttrFlags {
                     file_attributes: 0x0400,
                     is_symlink: true,
+                    reparse_tag: Some(0xa000_000c),
                 },
             ),
             (
@@ -214,6 +276,23 @@ mod tests {
                 RawWin32AttrFlags {
                     file_attributes: 0x0400,
                     is_symlink: false,
+                    reparse_tag: Some(0xa000_0003),
+                },
+            ),
+            (
+                root.join("unknown"),
+                RawWin32AttrFlags {
+                    file_attributes: 0x0400,
+                    is_symlink: false,
+                    reparse_tag: Some(0x8000_001b),
+                },
+            ),
+            (
+                root.join("resident"),
+                RawWin32AttrFlags {
+                    file_attributes: 0x0400,
+                    is_symlink: false,
+                    reparse_tag: Some(0x9000_f01a),
                 },
             ),
         ]);
@@ -222,7 +301,13 @@ mod tests {
             enumerations.push(path.to_owned());
             fs::read_dir(path)
         };
-        for rejected in ["placeholder", "symlink", "junction", ".dropbox.cache"] {
+        for rejected in [
+            "placeholder",
+            "symlink",
+            "junction",
+            "unknown",
+            ".dropbox.cache",
+        ] {
             walk(
                 &root.join(rejected),
                 &inspector,

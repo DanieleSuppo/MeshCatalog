@@ -5,7 +5,10 @@ use std::{
 
 use regex::Regex;
 
-use super::walker::InventoryEntry;
+use super::{
+    exclusions::supported_extension,
+    walker::{InventoryEntry, WalkCoverage},
+};
 
 static SCALE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(?:\d+(?:[.,]\d+)?\s*mm|1[_-]\d+)$").unwrap());
@@ -18,7 +21,7 @@ pub(crate) fn parent_path(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-fn technical(name: &str) -> bool {
+pub(crate) fn technical(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "stl"
@@ -40,7 +43,6 @@ struct Directory<'a> {
     name: &'a str,
     children: Vec<&'a str>,
     files: Vec<Member<'a>>,
-    has_other_file: bool,
     opaque: bool,
 }
 
@@ -65,9 +67,22 @@ pub(crate) struct Grouping<'a> {
     pub models: Vec<Model<'a>>,
     pub orphans: Vec<Member<'a>>,
     pub folded: BTreeSet<&'a str>,
+    incomplete_packs: BTreeSet<String>,
 }
 
-pub(crate) fn group(entries: &[InventoryEntry]) -> Grouping<'_> {
+impl Grouping<'_> {
+    pub fn incomplete_pack(&self, path: &str) -> bool {
+        !self.incomplete_packs.is_empty()
+            && self.incomplete_packs.contains(&WalkCoverage::key(path))
+    }
+}
+
+pub(crate) fn group<'a>(
+    entries: &'a [InventoryEntry],
+    coverage: &WalkCoverage,
+    legacy_root_children: &BTreeSet<String>,
+    was_pack: impl Fn(&str) -> bool,
+) -> Grouping<'a> {
     let mut dirs = BTreeMap::<&str, Directory>::new();
     for entry in entries {
         match entry {
@@ -102,12 +117,26 @@ pub(crate) fn group(entries: &[InventoryEntry]) -> Grouping<'_> {
                         cloud: metadata.flags.is_placeholder(),
                     });
             }
-            InventoryEntry::OtherFile { parent } => {
-                dirs.entry(parent).or_default().has_other_file = true
-            }
+            InventoryEntry::UnobservedLink { .. } => {}
         }
     }
     let mut result = Grouping::default();
+    let mut incomplete_children = BTreeSet::new();
+    for gap in coverage.gaps().filter(|path| !path.is_empty()) {
+        let parent = parent_path(gap);
+        let name = gap.rsplit('/').next().unwrap_or(gap);
+        incomplete_children.insert(parent);
+        if technical(name) || supported_extension(std::path::Path::new(name)).is_some() {
+            result.incomplete_packs.insert(parent.to_owned());
+        }
+        // A technical child with a gap cannot be proven terminal or folded.
+        if !parent.is_empty() && technical(parent.rsplit('/').next().unwrap_or(parent)) {
+            result
+                .incomplete_packs
+                .insert(parent_path(parent).to_owned());
+        }
+    }
+    let mut frozen_packs = BTreeSet::new();
     for (&path, dir) in &dirs {
         if result.folded.contains(path) {
             continue;
@@ -122,6 +151,27 @@ pub(crate) fn group(entries: &[InventoryEntry]) -> Grouping<'_> {
                 kind: "zip_archive",
                 members: vec![*f],
             }));
+        // A partial scan must not dismantle a legacy root pack before a complete regrouping.
+        if path.is_empty() && !legacy_root_children.is_empty() {
+            result.incomplete_packs.insert(String::new());
+        }
+        if !legacy_root_children.is_empty()
+            && !path.is_empty()
+            && legacy_root_children.contains(&WalkCoverage::key(path))
+        {
+            continue;
+        }
+        // Defer regrouping the historical pack and its potentially absorbed members.
+        if was_pack(path) && (coverage.unobserved(path) || result.incomplete_pack(path)) {
+            frozen_packs.insert(path);
+            continue;
+        }
+        if !parent_path(path).is_empty()
+            && frozen_packs.contains(parent_path(path))
+            && technical(dir.name)
+        {
+            continue;
+        }
         let mut members: Vec<_> = dir
             .files
             .iter()
@@ -129,10 +179,12 @@ pub(crate) fn group(entries: &[InventoryEntry]) -> Grouping<'_> {
             .filter(|f| f.ext != "zip")
             .collect();
         let mut absorbed = Vec::new();
-        if !path.is_empty() || !dir.files.is_empty() || dir.has_other_file {
+        if !path.is_empty() {
             for &child in &dir.children {
                 let child_dir = &dirs[child];
                 if !child_dir.opaque
+                    && !coverage.unobserved(child)
+                    && !incomplete_children.contains(WalkCoverage::key(child).as_str())
                     && child_dir.children.is_empty()
                     && technical(child_dir.name)
                     && !child_dir.files.iter().any(|f| f.ext == "zip")
@@ -151,8 +203,14 @@ pub(crate) fn group(entries: &[InventoryEntry]) -> Grouping<'_> {
         }
         members.sort_unstable_by_key(|f| (is_image(f.ext), f.path));
         result.folded.extend(absorbed.iter().copied());
-        let model = if members.len() >= 2 {
-            let leaf = !path.is_empty() && !direct_zip && absorbed.len() == dir.children.len();
+        let leaf = !path.is_empty()
+            && !technical(dir.name)
+            && !direct_zip
+            && !coverage.unobserved(path)
+            && !incomplete_children.contains(WalkCoverage::key(path).as_str())
+            && absorbed.len() == dir.children.len();
+        let indirect_leaf = leaf && parent_path(members[0].path) != path;
+        let model = if members.len() >= 2 || indirect_leaf {
             if leaf {
                 result.folded.insert(path);
             }

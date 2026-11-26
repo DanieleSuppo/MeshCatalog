@@ -28,8 +28,8 @@ export interface SourceDto {
   rootUri: string;
   rootDisplayPath: string;
   status: SourceStatus;
-  lastError: string | null;
-  lastScanAt: number | null;
+  lastError: string | null; // riepilogo diagnostico, anche con status 'idle'
+  lastScanAt: number | null; // completamento; gli avvisi ZIP recuperabili non lo bloccano
   modelCount: number;
   fileCount: number;
 }
@@ -137,7 +137,7 @@ export interface ModelDetailDto {
 | :--- | :--- | :--- | :--- |
 | `list_sources` | `—` | `SourceDto[]` | Restituisce tutte le sorgenti registrate con conteggi aggregati aggiornati. |
 | `add_local_source` | `path: string, name?: string` | `number` (`sourceId`) | Normalizza `path`, verifica che esista ed è una directory leggibile, rifiuta con `IpcError::SourceOverlap` se identica, parent o child di una sorgente già registrata; salva in SQLite senza scrivere nulla dentro `path`. |
-| `remove_source` | `sourceId: number` | `void` | Rimuove `source` e (via `ON DELETE CASCADE`) `folders`, `models`, `files` e relative voci `FTS5`; non tocca alcun file su disco utente. |
+| `remove_source` | `sourceId: number` | `void` | Rimuove `source` e (via `ON DELETE CASCADE`) `folders`, `models`, `files` e relative voci `FTS5`; non tocca alcun file su disco utente. Annulla la prenotazione accodata senza attendere altre sorgenti; per un job già in esecuzione attende solo il rilascio della sorgente rimossa. |
 | `pick_local_folder` | `—` | `string \| null` | Apre dialog nativo selezione cartella in sola lettura tramite `tauri-plugin-dialog`. |
 
 ### 2.2 Orchestrazione Indicizzazione Background (FR-004..FR-010)
@@ -145,7 +145,7 @@ export interface ModelDetailDto {
 | Comando | Input | Output (`Result<T, IpcError>`) | Comportamento / Invarianti |
 | :--- | :--- | :--- | :--- |
 | `start_index_scan` | `sourceId?: number` | `void` | Avvia in background (non bloccante) Pass 1 + Pass 2 sulla sorgente indicata o su tutte le sorgenti `local_dir`. Se una scansione è già attiva per la stessa sorgente, restituisce `IpcError::ScanAlreadyRunning`. |
-| `cancel_index_scan` | `sourceId?: number` | `void` | Attiva il `CancellationToken` della scansione in corso per fermarla in modo pulito al confine di transazione corrente. |
+| `cancel_index_scan` | `sourceId?: number` | `void` | Annulla subito le prenotazioni accodate selezionate. I job già in esecuzione si fermano al confine della transazione corrente. |
 | `get_scan_status` | `—` | `ScanStatusDto` | Restituisce se c'è una scansione attiva, passata corrente, conteggi ed eventuali errori recuperabili recenti. |
 
 ```typescript
@@ -165,8 +165,8 @@ export interface ScanStatusDto {
 
 | Comando | Input | Output (`Result<T, IpcError>`) | Comportamento / Invarianti |
 | :--- | :--- | :--- | :--- |
-| `get_folder_tree` | `sourceFilter: SourceFilter` | `FolderTreeNode[]` | Legge da SQLite solo le `folders` non-tecniche, costruendo l'albero per l'UI sidebar. |
-| `search_catalog` | `query: SearchQuery` | `SearchResultPage` | Legge solo SQLite (`WAL` + `FTS5`). **Caso 1 (`text.trim() === ""` e `folderId === null`):** vista radice "Tutte le sorgenti" (o filtrata su `sourceId`/`sourceFilter`) — restituisce in `subfolders` le cartelle radice delle sorgenti (`parent_id IS NULL` con conteggi ricorsivi e `sampleTitles`) e `items = []`. **Caso 2 (`text.trim() === ""` e `folderId != null`):** restituisce `subfolders` (sottocartelle dirette non-tecniche con `recursiveModelCount`, `recursiveFileCount`, `nestedFolderCount`, `sampleTitles`) + `items` diretti del livello. **Caso 3 (`text.trim() !== ""`):** `subfolders` è `[]` e la query utente viene sanitizzata/tokenizzata per `FTS5` (proteggendo `-`, `.`, `"`, `*`) filtrando ricorsivamente l'intero sotto-albero (o tutte le sorgenti se `folderId === null`) su `models_fts` (`viewMode === 'models'`) o `files_fts` (`viewMode === 'files'`). |
+| `get_folder_tree` | `sourceFilter: SourceFilter` | `FolderTreeNode[]` | Legge da SQLite solo i nodi navigabili (`is_visible = 1`), comprese le cartelle tecniche non assorbite, e costruisce l'albero. |
+| `search_catalog` | `query: SearchQuery` | `SearchResultPage` | Legge solo SQLite (`WAL` + `FTS5`). **Caso 1 (`text.trim() === ""` e `folderId === null`):** vista radice "Tutte le sorgenti" (o filtrata su `sourceId`/`sourceFilter`) — restituisce in `subfolders` le cartelle radice delle sorgenti (`parent_id IS NULL` con conteggi ricorsivi e `sampleTitles`) e `items = []`. **Caso 2 (`text.trim() === ""` e `folderId != null`):** restituisce `subfolders` (sottocartelle dirette navigabili con `recursiveModelCount`, `recursiveFileCount`, `nestedFolderCount`, `sampleTitles`) + `items` diretti del livello. **Caso 3 (`text.trim() !== ""`):** `subfolders` è `[]` e la query utente viene sanitizzata e ogni token è passato come prefisso letterale `"token"*` (la punteggiatura non ha significato sintattico). Filtra ricorsivamente l'intero sotto-albero, anche se contiene nodi non navigabili durante Pass 1 (o tutte le sorgenti se `folderId === null`) su `models_fts` (`viewMode === 'models'`) o `files_fts` (`viewMode === 'files'`). |
 | `get_model_detail` | `modelId: number` | `ModelDetailDto` | Restituisce i metadati del modello e l'elenco completo e ordinato dei file associati, con percorsi relativi interni. Nessun parsing mesh né decodifica immagini in M1. |
 
 ---

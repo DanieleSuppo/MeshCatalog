@@ -31,7 +31,8 @@ impl Database {
             let mut statement = conn.prepare_cached(
                 "SELECT f.id,f.source_id,f.parent_id,f.rel_path,f.name,
                 f.recursive_model_count,f.recursive_file_count,f.nested_folder_count
-                FROM folders f JOIN sources s ON s.id=f.source_id WHERE (?1 IS NULL OR s.kind=?1)
+                FROM folders f JOIN sources s ON s.id=f.source_id
+                WHERE f.is_visible=1 AND (?1 IS NULL OR s.kind=?1)
                 ORDER BY f.name COLLATE NOCASE,f.id",
             )?;
             let rows = statement.query_map([source_kind(filter)], |row| {
@@ -59,7 +60,7 @@ impl Database {
     pub fn search_catalog(&self, query: &SearchQuery) -> Result<SearchResultPage, IpcError> {
         let start = Instant::now();
         let browse = query.text.trim().is_empty();
-        let fts = (!browse).then(|| literal_fts(&query.text));
+        let fts = (!browse).then(|| fts_prefixes(&query.text));
         let mut page = SearchResultPage {
             total_models: 0,
             total_files: 0,
@@ -200,7 +201,7 @@ impl Scope<'_> {
 fn subfolders(conn: &Connection, query: &SearchQuery) -> rusqlite::Result<Vec<FolderCardDto>> {
     conn.prepare_cached(&format!("SELECT i.id,i.source_id,i.rel_path,i.name,i.recursive_model_count,i.recursive_file_count,
         i.nested_folder_count,coalesce(i.sample_titles_json,'[]'),coalesce(json_extract(i.summary_json,'$.cloud'),0)>0
-        FROM folders i WHERE i.parent_id IS ?1 AND {SOURCE_SCOPE} ORDER BY i.name COLLATE NOCASE,i.id"))?
+        FROM folders i WHERE i.is_visible=1 AND i.parent_id IS ?1 AND {SOURCE_SCOPE} ORDER BY i.name COLLATE NOCASE,i.id"))?
         .query_map(params![query.folder_id,query.source_id,source_kind(query.source_filter)], |r| {
             let titles = r.get_ref(7)?.as_str()?;
             let sample_titles = serde_json::from_str(titles).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error)))?;
@@ -210,11 +211,11 @@ fn subfolders(conn: &Connection, query: &SearchQuery) -> rusqlite::Result<Vec<Fo
         })?.collect()
 }
 
-fn literal_fts(text: &str) -> String {
+fn fts_prefixes(text: &str) -> String {
     static TOKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\p{L}\p{N}\p{M}]+").unwrap());
     TOKEN
         .find_iter(text)
-        .map(|token| format!("\"{}\"", token.as_str()))
+        .map(|token| format!("\"{}\"*", token.as_str()))
         .collect::<Vec<_>>()
         .join(" ")
 }

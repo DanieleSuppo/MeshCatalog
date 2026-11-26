@@ -21,17 +21,12 @@ Questo documento consolida le decisioni tecniche della Milestone M1, risolvendo 
 ## 2. Scudo Anti-Idratazione Win32 & Traversal Sicuro NTFS
 
 - **Decisione:**
-  - Definire in `meshcatalog-core` un'astrazione `EntryMetadataInspector` che ispeziona gli attributi senza mai aprire handle di lettura dati (`std::fs::symlink_metadata`).
-  - Su Windows (`#[cfg(target_os = "windows")]`), usare `std::os::windows::fs::MetadataExt::file_attributes()` controllando:
-    - `FILE_ATTRIBUTE_OFFLINE` (`0x0000_1000`)
-    - `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` (`0x0040_0000`)
-    - `FILE_ATTRIBUTE_RECALL_ON_OPEN` (`0x0004_0000`) come ulteriore difesa in profondità sui placeholder Cloud Files.
-  - Controllare i metadati prima di `std::fs::read_dir`. Saltare i symlink e non attraversare directory con `FILE_ATTRIBUTE_REPARSE_POINT` (`0x0400`), anche se `is_symlink()` restituisce `false`. Le directory con bit di richiamo/offline restano nel catalogo come directory opache, senza enumerazione né pruning basato sulla loro mancata enumerazione.
-  - Introdurre un `MockMetadataInspector` (o helper basato su struct `RawWin32AttrFlags { file_attributes: u32, is_symlink: bool }`) per testare su WSL2 tutte le combinazioni di bit Win32, junction e placeholder misti.
+  - `EntryMetadataInspector` implementa il [guard Win32](../../docs/02-ARCHITECTURE.md#21-scudo-anti-idratazione-su-disco-locale-win32-guard). Fuori Windows usa `std::fs::symlink_metadata`.
+  - Il walker e il guard di apertura verificano radice e antenati. Le directory con bit di richiamo/offline rimangono opache: non vengono enumerate e il contenuto storico viene conservato.
+  - `MockMetadataInspector` simula attributi e tag per testare file e directory residenti, segnaposto e reparse point senza accedere a Dropbox.
 - **Motivazione:** Garantisce **0 byte** scaricati da Dropbox Smart Sync (Principio II / SC-001) e impedisce loop infiniti o uscite dalla radice autorizzata su junction NTFS (FR-005).
 - **Alternative considerate:**
-  - *Chiamata diretta a `GetFileAttributesW` per ogni file via `windows-sys`:* Inutile overhead di FFI separato perché `std::fs::symlink_metadata` su Windows usa già `GetFileAttributesExW` / `FindFirstFileW` senza aprire data stream; l'astrazione su `MetadataExt` è idiomatica, sicura e priva di `unsafe`.
-  - *Filtraggio di qualsiasi `FILE_ATTRIBUTE_REPARSE_POINT` (`0x0400`) sui file:* Rifiutato perché i placeholder Dropbox/OneDrive Smart Sync portano legittimamente `REPARSE_POINT` insieme a `RECALL_ON_DATA_ACCESS` e devono essere catalogati come `cloud_placeholder` (non ignorati silenziosamente).
+  - *Soli attributi via `MetadataExt` o `GetFileAttributesW`:* Non bastano a distinguere un reparse point cloud residente da un reparse point sconosciuto o da una junction. `FindFirstFileW` espone il tag in `WIN32_FIND_DATAW.dwReserved0`.
 
 ---
 
@@ -44,10 +39,10 @@ Questo documento consolida le decisioni tecniche della Milestone M1, risolvendo 
   - **Esclusioni dentro `.zip`:** qualsiasi entry con segmento di path `__MACOSX` o filename che inizia con `._`.
   - **Raggruppamento deterministico (FR-007):**
     1. Ogni `.zip` (residente o placeholder) produce esattamente un `Model` con `container_kind = 'zip_archive'`. Se residente, le sue entry supportate diventano `CatalogFile` con `storage_state = 'zip_entry'` e `parent_archive_id` valorizzato.
-    2. Le sottocartelle dirette di una cartella `P` (purché `P` non sia la radice sorgente priva di file diretti) vengono classificate **sottocartelle tecniche terminali assorbibili** se soddisfano tutte e 3 le condizioni: (a) non hanno ulteriori sottocartelle al loro interno, (b) non contengono archivi `.zip`, e (c) il loro nome normalizzato corrisponde a nomi tecnici noti (`stl`, `stls`, `presupported`, `pre-supported`, `supported`, `unsupported`, `images`, `renders`, `render`, `lychee`, `files`) oppure a un pattern tecnico di scala (`^\d+(?:[.,]\d+)?\s*mm$` o `^1[_-]\d+$`, es. `32mm`, `75mm`). I file contenuti in tali sottocartelle vengono aggregati al `folder_pack` di `P` e le sottocartelle tecniche non vengono inserite in `folders`.
+    2. Le sottocartelle dirette di una cartella `P` (purché `P` non sia la radice sorgente) vengono classificate **sottocartelle tecniche terminali assorbibili** se soddisfano tutte e 3 le condizioni: (a) non hanno ulteriori sottocartelle al loro interno, (b) non contengono archivi `.zip`, e (c) il loro nome normalizzato corrisponde a nomi tecnici noti (`stl`, `stls`, `presupported`, `pre-supported`, `supported`, `unsupported`, `images`, `renders`, `render`, `lychee`, `files`) oppure a un pattern tecnico di scala (`^\d+(?:[.,]\d+)?\s*mm$` o `^1[_-]\d+$`, es. `32mm`, `75mm`). I file contenuti in tali sottocartelle vengono aggregati al `folder_pack` di `P` e le sottocartelle tecniche assorbite non vengono pubblicate nell'albero. I batch mantengono ricercabili i file dei nodi candidati tramite `folders.is_visible` (migrazione v3) e la CTE ricorsiva.
     3. Sui file non-`.zip` raccolti in `P` (diretti + assorbiti):
        - `count(3d_slicer) >= 2` oppure (`count(3d_slicer) == 1 && count(images) >= 1`) $\rightarrow$ `folder_pack`.
-       - `count(3d_slicer) == 1 && count(images) == 0` $\rightarrow$ `single_file`.
+       - `count(3d_slicer) == 1 && count(images) == 0` $\rightarrow$ `single_file`, salvo foglia non tecnica con unico membro in una sottocartella assorbita (`folder_pack` intitolato e collocato come da FR-007).
        - `count(3d_slicer) == 0` $\rightarrow$ nessun `Model` 3D per le sole immagini non associate. Tali immagini rimangono in `files` con `model_id = NULL` e in `files_fts`, nello scope di cartella e sorgente.
   - **Pulizia `display_title`:** Pipeline deterministica in Rust (`title_cleaner.rs`) che normalizza separatori (`_`, `.`), rimuove prefissi data/release (`2025_03_`, `[Creator]`), rimuove token tecnici (`presupported`, `unsupported`, `32mm`, `v2`, `stl`, `3mf`), preserva una leggibilità naturale e ricade sempre su `raw_name` se la stringa ripulita risultasse vuota.
 - **Motivazione:** Rispecchia esattamente la Chiarificazione 1 & 5 di `spec.md`, evita di esplodere un singolo modello in decine di card o cartelle tecniche `STL/` / `Presupported/` nell'albero navigabile, e garantisce compatibilità immediata con il futuro Segnale 3 del Motore Tassonomico (M3).
@@ -75,7 +70,7 @@ Questo documento consolida le decisioni tecniche della Milestone M1, risolvendo 
     - In Pass 2, ogni file `local_resident` con `(size_bytes, mtime_unix)` identici al DB e `content_hash IS NOT NULL` salta il calcolo `BLAKE3` (SC-004: `< 5s` su 40 GB invariati).
     - I nuovi file o file modificati vengono hashati in streaming (`blake3::Hasher::update_reader`, buffer 64 KB) usando un thread pool `rayon` dimensionato (`num_cpus.min(8)`).
     - Ogni `Model` calcola un `fingerprint` stabile (hash `BLAKE3` del singolo file, dello `.zip`, o della lista ordinata dei `(content_hash, size_bytes)` dei file membri di un `folder_pack`).
-    - Al termine della scansione di una sorgente **accessibile**, i `models` scomparsi dal vecchio path vengono confrontati 1:1 per `fingerprint` con i nuovi `models` comparsi nello stesso run: in caso di match, si aggiorna il record esistente (`id` preservato, nuovi `canonical_uri`, `folder_id`, `raw_name`, `display_title`) evitando duplicati e preservando la continuità di catalogo per M2/M3.
+    - La finalizzazione separa i risultati osservati dal pruning generale. Se la radice è accessibile, può riconciliare una rinomina certa 1:1 anche con un altro sottoalbero opaco o inaccessibile. Le righe sotto percorsi non osservati non sono candidate, e un pack incompleto conserva l'impronta precedente. Vedere [riconciliazione e `FTS5`](./data-model.md#26-riconciliazione-spostamenti-e-sincronizzazione-fts5).
 - **Motivazione:** Soddisfa SC-003 (`< 60s` prima scansione 40 GB), SC-004 (`< 5s` ri-scansione invariata) e SC-005 (`100%` preservazione identità su spostamenti/rinomine).
 
 ---

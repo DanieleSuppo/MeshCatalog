@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    path::Path,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     time::Instant,
 };
@@ -36,7 +37,8 @@ struct ScanState {
 }
 
 struct ActiveSource {
-    token: CancellationToken,
+    token: Arc<CancellationToken>,
+    running: bool,
     progress: Option<IndexerProgressEvent>,
 }
 
@@ -57,6 +59,11 @@ impl ScannerService {
         }))
     }
 
+    pub(crate) fn add(&self, path: &Path, name: Option<&str>) -> Result<i64, IpcError> {
+        let _gate = self.source_gate();
+        self.0.db.add_local_source(path, name)
+    }
+
     pub(crate) fn start(
         &self,
         source_id: Option<i64>,
@@ -64,11 +71,7 @@ impl ScannerService {
     ) -> Result<(), IpcError> {
         use meshcatalog_core::contracts::SourceKind;
 
-        let _gate = self
-            .0
-            .source_gate
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _gate = self.source_gate();
         let sources = self
             .0
             .db
@@ -91,12 +94,13 @@ impl ScannerService {
         }
         let mut pending = BTreeMap::new();
         for id in ids {
-            let token = CancellationToken::new();
+            let token = Arc::new(CancellationToken::new());
             pending.insert(id, token.clone());
             state.active.insert(
                 id,
                 ActiveSource {
                     token,
+                    running: false,
                     progress: None,
                 },
             );
@@ -111,19 +115,18 @@ impl ScannerService {
     }
 
     pub(crate) fn cancel(&self, source_id: Option<i64>) {
-        for (&id, source) in &self.state().active {
+        self.state().active.retain(|&id, source| {
             if source_id.is_none_or(|selected| selected == id) {
                 source.token.cancel();
+                source.running
+            } else {
+                true
             }
-        }
+        });
     }
 
     pub(crate) fn remove(&self, source_id: i64) -> Result<(), IpcError> {
-        let _gate = self
-            .0
-            .source_gate
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _gate = self.source_gate();
         self.cancel(Some(source_id));
         let state = self
             .0
@@ -139,7 +142,7 @@ impl ScannerService {
         let current = state
             .active
             .iter()
-            .find(|(_, active)| active.progress.is_some())
+            .find(|(_, active)| active.running)
             .or_else(|| state.active.first_key_value());
         let progress = current.and_then(|(_, active)| active.progress.as_ref());
         ScanStatusDto {
@@ -161,14 +164,40 @@ impl ScannerService {
         }
     }
 
+    fn source_gate(&self) -> MutexGuard<'_, ()> {
+        self.0
+            .source_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn state(&self) -> MutexGuard<'_, ScanState> {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
+impl ScanState {
+    fn reservation(
+        &mut self,
+        id: i64,
+        token: &Arc<CancellationToken>,
+    ) -> Option<&mut ActiveSource> {
+        // IDs can be reused after a queued source has been removed.
+        self.active
+            .get_mut(&id)
+            .filter(|source| Arc::ptr_eq(&source.token, token))
+    }
+
+    fn release(&mut self, id: i64, token: &Arc<CancellationToken>) {
+        if self.reservation(id, token).is_some() {
+            self.active.remove(&id);
+        }
+    }
+}
+
 struct Job {
     service: ScannerService,
-    pending: BTreeMap<i64, CancellationToken>,
+    pending: BTreeMap<i64, Arc<CancellationToken>>,
 }
 
 impl Job {
@@ -187,6 +216,19 @@ impl Job {
             },
         };
         while let Some((&id, token)) = self.pending.first_key_value() {
+            let claimed = self
+                .service
+                .state()
+                .reservation(id, token)
+                .map(|source| {
+                    source.running = true;
+                })
+                .is_some();
+            if !claimed {
+                sink.completed.cancelled = true;
+                self.pending.remove(&id);
+                continue;
+            }
             match run_scan(
                 &self.service.0.db,
                 id,
@@ -206,8 +248,8 @@ impl Job {
                     recoverable: false,
                 }),
             }
+            self.service.state().release(id, token);
             self.pending.remove(&id);
-            self.service.state().active.remove(&id);
             self.service.0.released.notify_all();
         }
         sink.completed.duration_ms = start.elapsed().as_millis() as u64;
@@ -219,8 +261,8 @@ impl Drop for Job {
     fn drop(&mut self) {
         // Release reservations even if the background worker unwinds.
         let mut state = self.service.state();
-        for id in self.pending.keys() {
-            state.active.remove(id);
+        for (&id, token) in &self.pending {
+            state.release(id, token);
         }
         self.service.0.released.notify_all();
     }
@@ -317,6 +359,98 @@ mod tests {
             }
         }
         assert!(!service.status().is_running);
+    }
+
+    #[test]
+    fn removes_queued_source_before_current_scan_finishes_and_never_claims_its_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let db = Arc::new(Database::open(&root.join("catalog.db")).unwrap());
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        fs::write(b.join("mesh.stl"), b"mesh").unwrap();
+        let a_id = db.add_local_source(&a, None).unwrap();
+        let b_id = db.add_local_source(&b, None).unwrap();
+        let service = ScannerService::new(db.clone());
+        let deadline = Duration::from_secs(5);
+        let (first_tx, first_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut first = true;
+        service
+            .start(None, move |event| {
+                if matches!(&event, ScanEvent::Progress(p) if p.source_id == a_id)
+                    && std::mem::take(&mut first)
+                {
+                    first_tx.send(event).unwrap();
+                    let _ = resume_rx.recv();
+                } else {
+                    let _ = first_tx.send(event);
+                }
+            })
+            .unwrap();
+        assert!(matches!(
+            first_rx.recv_timeout(deadline).unwrap(),
+            ScanEvent::Progress(_)
+        ));
+        let (removed_tx, removed_rx) = mpsc::channel();
+        let removing = service.clone();
+        let remover = std::thread::spawn(move || {
+            let _ = removed_tx.send(removing.remove(b_id));
+        });
+        let removed = removed_rx.recv_timeout(deadline);
+        if removed.is_err() {
+            resume_tx.send(()).unwrap();
+            remover.join().unwrap();
+            panic!("removal waited for the first source");
+        }
+        removed.unwrap().unwrap();
+        remover.join().unwrap();
+        let replacement = service.add(&b, None).unwrap();
+        assert_eq!(replacement, b_id); // SQLite can reuse the deleted source ID.
+        let (next_tx, next_rx) = mpsc::channel();
+        let (next_resume_tx, next_resume_rx) = mpsc::channel();
+        let mut first = true;
+        service
+            .start(Some(replacement), move |event| {
+                if matches!(event, ScanEvent::Progress(_)) && std::mem::take(&mut first) {
+                    next_tx.send(event).unwrap();
+                    let _ = next_resume_rx.recv();
+                } else {
+                    let _ = next_tx.send(event);
+                }
+            })
+            .unwrap();
+        assert!(matches!(
+            next_rx.recv_timeout(deadline).unwrap(),
+            ScanEvent::Progress(_)
+        ));
+        resume_tx.send(()).unwrap();
+        loop {
+            match first_rx.recv_timeout(deadline).unwrap() {
+                ScanEvent::Completed(event) => {
+                    assert!(event.cancelled);
+                    break;
+                }
+                ScanEvent::Progress(event) => assert_eq!(event.source_id, a_id),
+                ScanEvent::Error(event) => panic!("{}", event.message),
+                ScanEvent::BatchUpdated(event) => assert_eq!(event.source_id, a_id),
+            }
+        }
+        assert_eq!(service.status().active_source_id, Some(replacement));
+        assert!(matches!(
+            service.start(Some(replacement), |_| {}),
+            Err(IpcError::ScanAlreadyRunning)
+        ));
+        next_resume_tx.send(()).unwrap();
+        loop {
+            if let ScanEvent::Completed(event) = next_rx.recv_timeout(deadline).unwrap() {
+                assert!(!event.cancelled);
+                assert_eq!(event.files_indexed, 1);
+                break;
+            }
+        }
     }
 
     #[test]

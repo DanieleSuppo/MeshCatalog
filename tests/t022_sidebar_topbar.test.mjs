@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { test } from 'node:test';
+import { after, before, test } from 'node:test';
 import { createServer } from 'vite';
 import { renderToStaticMarkup } from 'react-dom/server';
 
@@ -9,13 +9,13 @@ let SourceSidebar;
 let TopCommandBar;
 let sourceErrorMessage;
 
-test.before(async () => {
+before(async () => {
   server = await createServer({ server: { middlewareMode: true, ws: false }, appType: 'custom' });
   ({ SourceSidebar, sourceErrorMessage } = await server.ssrLoadModule('/src/components/SourceSidebar.tsx'));
   ({ TopCommandBar } = await server.ssrLoadModule('/src/components/TopCommandBar.tsx'));
 });
 
-test.after(async () => {
+after(async () => {
   await server?.close();
 });
 

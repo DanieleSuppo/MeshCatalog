@@ -9,15 +9,15 @@ La Milestone M1 costruisce le fondamenta desktop di **MeshCatalog** con **Tauri 
 - Gestione sorgenti locali in sola lettura con stato persistito esclusivamente in `%LOCALAPPDATA%\MeshCatalog` (zero sidecar nelle cartelle utente).
 - Scanner locale NTFS dotato di **Win32 Anti-Hydration Guard** (`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` `0x0040_0000` e `FILE_ATTRIBUTE_OFFLINE` `0x0000_1000`), esclusione automatica di file/cartelle di servizio, metadati macOS (`__MACOSX/`, `._*`) e mancato attraversamento di symlink/junction NTFS, pur catalogando i segnaposto cloud *Online-Only* dai soli metadati di nome/percorso con badge `Cloud / Online-Only`.
 - Raggruppamento deterministico in `folder_pack` (con assorbimento delle sottocartelle tecniche terminali), `zip_archive` (lettura sola Central Directory tramite crate `zip` senza estrazione su disco) e `single_file`, con derivazione di `display_title` leggibili e scansione incrementale `BLAKE3` resiliente a spostamenti e rinomine.
-- Shell UI desktop con tema studio neutro scuro (`#121417` / `#1B1F24` / `#272C33`), barra comandi/ricerca con switch istantaneo `Modelli / Pack (default) | Singoli File`, indicatore scansione non bloccante, albero cartelle non-tecniche, griglia virtualizzata (`@tanstack/react-virtual`) con anteprime ricorsive delle sottocartelle e Inspector laterale testuale di sola lettura (zero WebGL/3D o decodifica immagini in M1).
+- Shell UI desktop con tema studio neutro scuro (`#121417` / `#1B1F24` / `#272C33`), barra comandi/ricerca con switch istantaneo `Modelli / Pack (default) | Singoli File`, indicatore scansione non bloccante, albero delle cartelle navigabili, griglia virtualizzata (`@tanstack/react-virtual`) con anteprime ricorsive delle sottocartelle e Inspector laterale testuale di sola lettura (zero WebGL/3D o decodifica immagini in M1).
 
 ---
 
 ## Technical Context
 
-**Language/Version**: Rust (stable, Edition 2021) per core engine e backend Tauri; TypeScript ~5.x + React 19 per frontend (`Node.js >= 18 LTS`, verificato `v18.15.0` / `npm 9.6.5` in WSL2; toolchain Rust da installare/verificare in WSL2 e su Windows MSVC).  
+**Language/Version**: Rust (stable, Edition 2021) per core engine e backend Tauri; TypeScript ~5.x + React 19 per frontend (`Node.js 22 LTS >=22.12.0`, verificato `v22.23.2` / `npm 10.9.8` in WSL2, `engines` in `package.json`; toolchain Rust da installare/verificare in WSL2 e su Windows MSVC).
 **Primary Dependencies**:
-- Backend Rust (`src-tauri/` workspace): `tauri` v2, `tauri-plugin-dialog`, `rusqlite` (`bundled`, `FTS5`), `blake3`, `zip` (solo lettura Central Directory), `walkdir`, `tokio`, `tokio-util`, `rayon`, `serde`, `serde_json`, `thiserror`, `regex` (o parser leggero per scale/noise).
+- Backend Rust (`src-tauri/` workspace): `tauri` v2, `tauri-plugin-dialog`, `rusqlite` (`bundled`, `FTS5`), `blake3`, `zip` (solo lettura Central Directory), `windows-sys` (solo Windows), `tokio`, `tokio-util`, `rayon`, `serde`, `serde_json`, `thiserror`, `regex` (o parser leggero per scale/noise).
 - Frontend UI (`src/`): `react` 19, `react-dom` 19, `@tanstack/react-virtual`, `@tauri-apps/api` v2, Vite.
 **Storage**: SQLite locale (`%LOCALAPPDATA%\MeshCatalog\catalog.db`, modalità `WAL`, `foreign_keys = ON`, tabelle virtuali `FTS5` `models_fts` e `files_fts`) dove in M1 risiedono sorgenti e catalogo (`config.json` rimandato a M2/M4); zero scritture nelle directory utente.  
 **Testing**:
@@ -45,12 +45,12 @@ La Milestone M1 costruisce le fondamenta desktop di **MeshCatalog** con **Tauri 
 | Principio | Stato Pre-Design | Stato Post-Design | Verifica e Controlli Specifici in M1 |
 | :--- | :---: | :---: | :--- |
 | **I. Read-Only User Filesystem (Zero Sidecars)** | PASS | PASS | Lo scanner apre i soli file residenti locali in sola lettura (`File::open`), non scrive mai `.zip` estratti né sidecar nelle cartelle utente; `catalog.db` e log risiedono esclusivamente in `app_local_data_dir` (`%LOCALAPPDATA%\MeshCatalog`). |
-| **II. Dropbox Zero-Explosion (Win32 Anti-Hydration Guard)** | PASS | PASS | Prima di qualsiasi `File::open`, `EntryMetadataInspector` legge gli attributi via `MetadataExt::file_attributes()` su Windows verificando `FILE_ATTRIBUTE_OFFLINE (0x1000)` e `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS (0x400000)` (oltre a `RECALL_ON_OPEN`). I placeholder vengono registrati come `cloud_placeholder` dai soli nome/path senza aprire data stream o estrarre `.zip`. |
+| **II. Dropbox Zero-Explosion (Win32 Anti-Hydration Guard)** | PASS | PASS | `EntryMetadataInspector` usa lookup Win32 di soli metadati per verificare attributi e tag reparse su radice, antenati e file. Il [guard Win32](../../docs/02-ARCHITECTURE.md#21-scudo-anti-idratazione-su-disco-locale-win32-guard) blocca enumerazione e aperture dati per i segnaposto. |
 | **III. Zero-Latency 2D Browsing vs On-Demand 3D Viewport** | PASS | PASS | La UI legge solo da SQLite (`WAL` + `FTS5`) tramite connessioni read-only dedicate; griglia e lista usano `@tanstack/react-virtual` (`< 16 ms`). Zero WebGL/Three.js e zero parsing 3D in M1; l'Inspector mostra solo metadati testuali e lista file. |
 | **IV. Code-Driven Automatic Bilingual Taxonomy (No Rule-Builder UI)** | PASS | PASS | M1 non introduce alcun tagging manuale o configuratore UI di regole; la pulizia `display_title` e il raggruppamento pack sono 100% deterministici nel codice Rust, e lo schema SQLite include già `tags`, `model_tags`, `fingerprint_overrides` e `models_fts` pronti per il motore tassonomico M3 senza migrazioni distruttive. |
-| **V. Zero Proprietary Licenses & Cross-OS WSL2 <-> Windows Verification** | PASS | PASS | Solo crate/pacchetti open-source (`rusqlite` bundled, `blake3`, `zip`, `walkdir`, `tokio`, `rayon`, React, `@tanstack/react-virtual`). La separazione in `meshcatalog-core` consente `cargo test` nativo in WSL2 Linux mentre l'app Tauri/Win32 viene verificata su Windows 10/11. |
+| **V. Zero Proprietary Licenses & Cross-OS WSL2 <-> Windows Verification** | PASS | PASS | Solo crate/pacchetti open-source (`rusqlite` bundled, `blake3`, `zip`, `windows-sys`, `tokio`, `rayon`, React, `@tanstack/react-virtual`). La separazione in `meshcatalog-core` consente `cargo test` nativo in WSL2 Linux mentre l'app Tauri/Win32 viene verificata su Windows 10/11. |
 
-La migrazione SQLite v2 rende opzionale `files.model_id` solo per le immagini non associate. Conserva ID, riferimenti, indici, FTS e override esistenti. L'interfaccia espone questi file senza Inspector modello.
+La migrazione SQLite v2 rende opzionale `files.model_id` solo per le immagini non associate. Conserva ID, riferimenti, indici, FTS e override esistenti. L'interfaccia espone questi file senza Inspector modello. La migrazione v3 aggiunge `folders.is_visible`: i batch di inventario mantengono ricercabili i file senza mostrare candidati tecnici provvisori.
 
 Nessuna violazione della Costituzione rilevata: la sezione *Complexity Tracking* resta vuota.
 
@@ -88,7 +88,7 @@ src/                           # Frontend React + TypeScript (UI M1)
 │   └── tauriClient.ts         # Wrapper tipizzato invoke/listen allineato a contracts/tauri-ipc.md
 ├── components/
 │   ├── TopCommandBar.tsx      # Search FTS5, toggle Modelli/Pack | Singoli File, progress pill
-│   ├── SourceSidebar.tsx      # Elenco sorgenti locali + albero cartelle non-tecniche
+│   ├── SourceSidebar.tsx      # Elenco sorgenti locali + albero cartelle navigabili
 │   ├── FolderCard.tsx         # Card sottocartella (conteggi ricorsivi, sottolivelli, 3-4 titoli)
 │   ├── CatalogGrid.tsx        # Griglia/lista virtualizzata (@tanstack/react-virtual)
 │   ├── ModelOrFileCard.tsx    # Card segnaposto M1 (badge formato, ZIP, Cloud / Online-Only)

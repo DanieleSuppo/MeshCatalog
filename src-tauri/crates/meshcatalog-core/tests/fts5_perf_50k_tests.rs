@@ -50,6 +50,9 @@ fn global_and_recursive_fts_50k_respect_budget_and_literal_punctuation() {
             for (text, count) in [
                 ("King-Thror", k),
                 ("\"King-Thror\"*", k),
+                ("\"Kin-Thr\"*", k),
+                ("Kin* OR Thr", 0),
+                (".st", all),
                 (".stl", all),
                 ("\".*-", 0),
             ] {

@@ -2030,6 +2030,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio-util",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

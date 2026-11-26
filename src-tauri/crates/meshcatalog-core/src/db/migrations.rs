@@ -5,6 +5,7 @@ use crate::error::IpcError;
 const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/001_initial_schema.sql"),
     include_str!("../../migrations/002_allow_unassociated_images.sql"),
+    include_str!("../../migrations/003_folder_visibility.sql"),
 ];
 
 pub(super) fn run(connection: &mut Connection) -> Result<(), IpcError> {

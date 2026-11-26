@@ -67,6 +67,7 @@ fn recall_bits_independently_classify_placeholders_but_reparse_alone_does_not() 
         let flags = RawWin32AttrFlags {
             file_attributes: bits,
             is_symlink: false,
+            reparse_tag: None,
         };
         assert_eq!(flags.is_placeholder(), expected, "mask {bits:#x}");
     }
@@ -133,6 +134,42 @@ fn source_registration_does_not_follow_symlink_with_trailing_separator() {
     assert!(db.list_sources().unwrap().is_empty());
 }
 
+#[cfg(windows)]
+#[test]
+fn native_junction_is_rejected_as_root_or_ancestor_and_not_walked() {
+    let (dir, db, root) = fixture();
+    let external = dir.path().join("external");
+    fs::create_dir_all(external.join("child")).unwrap();
+    fs::write(external.join("child/outside.stl"), b"outside").unwrap();
+    // Keep mklink's arguments relative to the private fixture, not a user's library.
+    let output = std::process::Command::new("cmd.exe")
+        .current_dir(dir.path())
+        .args(["/d", "/c", "mklink", "/J", r"library\junction", "external"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let junction = root.join("junction");
+    let metadata = OsMetadataInspector.inspect(&junction).unwrap();
+    assert_eq!(metadata.flags.reparse_tag, Some(0xa000_0003));
+    assert!(db.add_local_source(&junction, None).is_err());
+    assert!(db.add_local_source(&junction.join("child"), None).is_err());
+    let id = db.add_local_source(&root, None).unwrap();
+    fs::write(root.join("inside.stl"), b"inside").unwrap();
+    let stats = run_scan(
+        &db,
+        id,
+        &OsMetadataInspector,
+        &CancellationToken::new(),
+        &mut Events::default(),
+    )
+    .unwrap();
+    assert_eq!((stats.files_indexed, stats.errors_count), (1, 0));
+}
+
 #[test]
 fn metadata_only_pipeline_indexes_placeholders_and_cascades_without_writing_source() {
     let (dir, db, root) = fixture();
@@ -162,6 +199,7 @@ fn metadata_only_pipeline_indexes_placeholders_and_cascades_without_writing_sour
         RawWin32AttrFlags {
             file_attributes: 0x0040_0400,
             is_symlink: false,
+            reparse_tag: Some(0x9000_001a),
         },
     )]);
     let id = db.add_local_source(&root, Some("Test Library")).unwrap();
@@ -176,7 +214,7 @@ fn metadata_only_pipeline_indexes_placeholders_and_cascades_without_writing_sour
         (2, 2, 0)
     );
     assert!(!stats.cancelled);
-    assert_eq!(events.batches.len(), 1);
+    assert_eq!(events.batches.len(), 2); // Streaming inventory, then definitive grouping.
     assert_eq!(events.batches[0].updated_folder_ids.len(), 2);
     assert_eq!(events.batches[0].updated_model_ids.len(), 2);
     assert_eq!(events.progress.last().unwrap().processed, 2);
@@ -281,6 +319,7 @@ fn unreadable_subtree_is_not_pruned_and_does_not_block_its_siblings() {
             let mut metadata = OsMetadataInspector.inspect(path)?;
             if path.ends_with("sibling.obj") {
                 metadata.flags.file_attributes = 0x0400;
+                metadata.flags.reparse_tag = Some(0x9000_301a);
             }
             Ok(metadata)
         }
@@ -339,6 +378,35 @@ fn unreadable_subtree_is_not_pruned_and_does_not_block_its_siblings() {
 }
 
 #[test]
+fn unknown_reparse_files_and_directories_are_not_opened_or_indexed() {
+    let (_dir, db, root) = fixture();
+    fs::write(root.join("unknown.stl"), b"must not hash").unwrap();
+    fs::create_dir(root.join("unknown-dir")).unwrap();
+    fs::write(root.join("unknown-dir/hidden.stl"), []).unwrap();
+    let inspector = MockMetadataInspector::new(["unknown.stl", "unknown-dir"].map(|name| {
+        (
+            root.join(name),
+            RawWin32AttrFlags {
+                file_attributes: 0x0400,
+                is_symlink: false,
+                reparse_tag: None,
+            },
+        )
+    }));
+    let id = db.add_local_source(&root, None).unwrap();
+    let stats = run_scan(
+        &db,
+        id,
+        &inspector,
+        &CancellationToken::new(),
+        &mut Events::default(),
+    )
+    .unwrap();
+    assert_eq!(stats.files_indexed, 0);
+    assert_eq!(db.list_sources().unwrap()[0].model_count, 0);
+}
+
+#[test]
 fn opaque_directory_finishes_with_a_visible_notice() {
     let (_dir, db, root) = fixture();
     let cloud = root.join("Remote");
@@ -349,6 +417,7 @@ fn opaque_directory_finishes_with_a_visible_notice() {
         RawWin32AttrFlags {
             file_attributes: 0x1000,
             is_symlink: false,
+            reparse_tag: None,
         },
     )]);
     let id = db.add_local_source(&root, None).unwrap();

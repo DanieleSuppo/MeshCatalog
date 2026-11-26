@@ -24,8 +24,8 @@ pub(crate) async fn add_local_source(
     path: String,
     name: Option<String>,
 ) -> Result<i64, IpcError> {
-    let db = state.db.clone();
-    blocking(move || db.add_local_source(Path::new(&path), name.as_deref())).await
+    let scans = state.scans.clone();
+    blocking(move || scans.add(Path::new(&path), name.as_deref())).await
 }
 
 #[tauri::command]
