@@ -52,3 +52,16 @@ Qualsiasi modifica futura **deve rispettare** questi 4 vincoli strutturali:
 | [docs/03-TAXONOMY-ENGINE.md](./docs/03-TAXONOMY-ENGINE.md) | Algoritmo di classificazione multi-segnale, facce ortogonali, dizionario IT/EN e regole di override. |
 | [docs/04-UI-UX-AND-IPC.md](./docs/04-UI-UX-AND-IPC.md) | Specifiche UI, algoritmo Smart Folder Preview, viewport 3D on-demand e contratti Tauri IPC. |
 | [docs/05-ROADMAP.md](./docs/05-ROADMAP.md) | Piano di implementazione per milestone (`M0` -> `M5`) e checklist build WSL2 <-> Windows. |
+
+---
+
+## 5. Workflow Spec Kit (Spec-Driven Development)
+
+Lo sviluppo delle milestone segue il workflow **GitHub Spec Kit** (`specify`, integrazione Antigravity in `.agents/skills/speckit-*` e infrastruttura in `.specify/`):
+
+- **Costituzione di progetto:** [.specify/memory/constitution.md](./.specify/memory/constitution.md) — codifica gli invarianti non negoziabili (Principi I–V) validati ad ogni gate `/speckit-plan` e `/speckit-analyze`.
+- **Architettura Master vs Specifiche di Milestone:**
+  - `docs/01..05` contengono la specifica master globale (DDL SQLite completo, matrice formati, contratti IPC, roadmap `M1`–`M5`).
+  - `specs/NNN-<milestone>/` ospita gli artefatti operativi generati per ciascuna milestone (`/speckit-specify` $\rightarrow$ `/speckit-plan` $\rightarrow$ `/speckit-tasks` $\rightarrow$ `/speckit-analyze` $\rightarrow$ `/speckit-implement`).
+- **Granularità:** Usare Spec Kit per verticali/milestone complete (`M1`..`M4`), non per micro-modifiche ai dizionari o correzioni puntuali.
+

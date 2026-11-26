@@ -44,3 +44,12 @@ MeshCatalog trasforma centinaia di gigabyte di modelli sparsi tra **SSD locale**
 - [03 — Motore Tassonomico Automatico](./docs/03-TAXONOMY-ENGINE.md) — Facce semantiche, punteggio multi-segnale, dizionario IT/EN e override inline.
 - [04 — UI/UX e Contratti IPC](./docs/04-UI-UX-AND-IPC.md) — Layout, Smart Folder Card, Inspector, Viewer 3D on-demand e API Tauri IPC.
 - [05 — Roadmap di Implementazione](./docs/05-ROADMAP.md) — Milestone operative da M0 a M5 e checklist cross-OS.
+- [Costituzione Spec Kit](./.specify/memory/constitution.md) — Principi architetturali non negoziabili e governance per il workflow `/speckit-*`.
+
+---
+
+## Workflow di Sviluppo Spec-Driven (Spec Kit)
+
+Ogni milestone della roadmap viene sviluppata tramite le skill **Spec Kit** installate in `.agents/skills/`:
+`/speckit-specify` $\rightarrow$ `/speckit-clarify` *(opzionale)* $\rightarrow$ `/speckit-plan` $\rightarrow$ `/speckit-tasks` $\rightarrow$ `/speckit-analyze` $\rightarrow$ `/speckit-implement`.
+

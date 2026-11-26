@@ -1,5 +1,6 @@
 # Cross-OS WSL2 <-> Windows line ending normalization
 * text=auto eol=lf
+*.sh text eol=lf
 
 # Windows scripts must keep CRLF
 *.bat text eol=crlf
