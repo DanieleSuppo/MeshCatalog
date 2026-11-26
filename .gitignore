@@ -20,6 +20,7 @@ dist-ssr/
 *.sqlite3
 cache/
 thumbnails/
+.agents/ctx.cache.md
 
 # Secrets & Environment
 .env

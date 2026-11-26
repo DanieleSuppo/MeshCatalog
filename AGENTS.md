@@ -59,7 +59,8 @@ Qualsiasi modifica futura **deve rispettare** questi 4 vincoli strutturali:
 
 Lo sviluppo delle milestone segue il workflow **GitHub Spec Kit** (`specify`, integrazione Antigravity in `.agents/skills/speckit-*` e infrastruttura in `.specify/`):
 
-- **Costituzione di progetto:** [.specify/memory/constitution.md](./.specify/memory/constitution.md) — codifica gli invarianti non negoziabili (Principi I–V) validati ad ogni gate `/speckit-plan` e `/speckit-analyze`.
+- **Costituzione di progetto:** [Spec Kit constitution](./.specify/memory/constitution.md) — codifica gli invarianti non negoziabili (Principi I–V) validati ad ogni gate `/speckit-plan` e `/speckit-analyze`.
+- **Specifiche operative di milestone:** [Working specifications](./specs) — artefatti Spec Kit per ciascuna milestone (`spec.md`, `plan.md`, `tasks.md`).
 - **Architettura Master vs Specifiche di Milestone:**
   - `docs/01..05` contengono la specifica master globale (DDL SQLite completo, matrice formati, contratti IPC, roadmap `M1`–`M5`).
   - `specs/NNN-<milestone>/` ospita gli artefatti operativi generati per ciascuna milestone (`/speckit-specify` $\rightarrow$ `/speckit-plan` $\rightarrow$ `/speckit-tasks` $\rightarrow$ `/speckit-analyze` $\rightarrow$ `/speckit-implement`).
