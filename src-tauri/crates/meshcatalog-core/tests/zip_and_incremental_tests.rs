@@ -1,0 +1,939 @@
+mod common;
+
+use common::{Events, Fixture};
+use meshcatalog_core::{
+    contracts::{
+        IndexerBatchUpdatedEvent, IndexerErrorEvent, IndexerPass, IndexerProgressEvent,
+        SearchItemDto, SearchQuery, SourceFilter, SourceStatus, ViewMode,
+    },
+    pipeline::{run_scan, PipelineSink},
+    scanner::attr_guard::{
+        EntryMetadata, EntryMetadataInspector, MockMetadataInspector, OsMetadataInspector,
+        RawWin32AttrFlags,
+    },
+};
+use std::{
+    fs,
+    io::{self, Write},
+    path::Path,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+    time::{Duration, SystemTime},
+};
+use tokio_util::sync::CancellationToken;
+use zip::{write::SimpleFileOptions, ZipWriter};
+
+fn zip(path: &Path, names: &[&str]) {
+    let mut archive = ZipWriter::new(fs::File::create(path).unwrap());
+    for name in names {
+        archive
+            .start_file(
+                *name,
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        archive.write_all(b"payload").unwrap();
+    }
+    archive.finish().unwrap();
+}
+
+#[test]
+fn archive_indexes_only_supported_safe_entries_and_survives_bad_archives() {
+    let f = Fixture::new();
+    let archive = f.root.join("2025_03_King-Thror_32mm.zip");
+    zip(
+        &archive,
+        &[
+            "inside/Throne.stl",
+            "nested.zip",
+            "photo.png",
+            "inside/__MACOSX/ignored.stl",
+            "inside/._ignored.stl",
+            "readme.txt",
+            "../escape.stl",
+        ],
+    );
+    f.file("corrupt.zip", b"broken");
+    f.file("cloud.zip", b"never parse");
+    // Info-ZIP fixture: `zip -X -0 -P fixture protected.zip secret.stl`.
+    f.file(
+        "protected.zip",
+        &[
+            80, 75, 3, 4, 10, 0, 9, 0, 0, 0, 40, 156, 122, 93, 238, 64, 229, 5, 19, 0, 0, 0, 7, 0,
+            0, 0, 10, 0, 0, 0, 115, 101, 99, 114, 101, 116, 46, 115, 116, 108, 50, 130, 220, 217,
+            131, 213, 153, 112, 245, 20, 198, 56, 222, 80, 107, 138, 8, 196, 239, 80, 75, 7, 8,
+            238, 64, 229, 5, 19, 0, 0, 0, 7, 0, 0, 0, 80, 75, 1, 2, 30, 3, 10, 0, 9, 0, 0, 0, 40,
+            156, 122, 93, 238, 64, 229, 5, 19, 0, 0, 0, 7, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 180, 129, 0, 0, 0, 0, 115, 101, 99, 114, 101, 116, 46, 115, 116, 108, 80, 75, 5, 6,
+            0, 0, 0, 0, 1, 0, 1, 0, 56, 0, 0, 0, 75, 0, 0, 0, 0, 0,
+        ],
+    );
+    let contents = fs::read(&archive).unwrap();
+    let inspector = MockMetadataInspector::new([(
+        f.root.join("cloud.zip"),
+        RawWin32AttrFlags {
+            file_attributes: 0x1000,
+            is_symlink: false,
+            reparse_tag: None,
+        },
+    )]);
+    let mut sink = Events::default();
+    let stats = run_scan(
+        &f.db,
+        f.source,
+        &inspector,
+        &CancellationToken::new(),
+        &mut sink,
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            stats.models_indexed,
+            stats.files_indexed,
+            stats.errors_count
+        ),
+        (4, 7, 2)
+    );
+    assert!(sink
+        .progress
+        .iter()
+        .any(|e| e.pass == IndexerPass::Metadata));
+    let mut errors: Vec<_> = sink
+        .errors
+        .iter()
+        .map(|e| {
+            assert!(e.recoverable);
+            e.path.as_deref().unwrap()
+        })
+        .collect();
+    errors.sort_unstable();
+    assert!(errors[0].ends_with("corrupt.zip") && errors[1].ends_with("protected.zip"));
+    let source = &f.db.list_sources().unwrap()[0];
+    assert_eq!(source.status, SourceStatus::Idle);
+    assert!(source.last_scan_at.is_some());
+    let diagnostic = source.last_error.as_deref().unwrap();
+    assert!(diagnostic.contains("corrupt.zip") && diagnostic.contains("protected.zip"));
+
+    fs::create_dir(f.root.join("cloud-dir")).unwrap();
+    let mixed = MockMetadataInspector::new(["cloud.zip", "cloud-dir"].map(|path| {
+        (
+            f.root.join(path),
+            RawWin32AttrFlags {
+                file_attributes: 0x1000,
+                is_symlink: false,
+                reparse_tag: None,
+            },
+        )
+    }));
+    f.db.with_writer(|db| {
+        db.execute("UPDATE sources SET last_scan_at=1 WHERE id=?1", [f.source])?;
+        Ok(())
+    })
+    .unwrap();
+    scan(&f, &mixed);
+    let source = &f.db.list_sources().unwrap()[0];
+    assert!(source.last_scan_at.unwrap() > 1);
+    let diagnostic = source.last_error.as_deref().unwrap();
+    for warning in ["corrupt.zip", "protected.zip", "Online-Only"] {
+        assert!(diagnostic.contains(warning), "{diagnostic}");
+    }
+    fs::remove_dir(f.root.join("cloud-dir")).unwrap();
+    assert_eq!(fs::read_dir(&f.root).unwrap().count(), 4);
+    assert_eq!(fs::read(&archive).unwrap(), contents);
+    f.db.with_reader(|db| {
+        let mut s = db.prepare("SELECT e.rel_path, e.ext, e.size_bytes, e.zip_entry_csize, e.zip_entry_method, e.index_pass, e.uri, p.uri FROM files e JOIN files p ON p.id=e.parent_archive_id WHERE e.storage_state='zip_entry' ORDER BY e.rel_path")?;
+        let expected = [("inside/Throne.stl", "stl"), ("nested.zip", "zip"), ("photo.png", "png")];
+        let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, i64>(2)?,r.get::<_, i64>(3)?,r.get::<_, i64>(4)?,r.get::<_, i64>(5)?,r.get::<_, String>(6)?,r.get::<_, String>(7)?)))?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), expected.len());
+        for ((path, ext, size, csize, method, pass, uri, parent), (want_path, want_ext)) in rows.into_iter().zip(expected) {
+            assert_eq!((path.as_str(), ext.as_str(), size, csize, method, pass), (want_path, want_ext, 7, 7, 0, 2));
+            assert_eq!(uri, format!("zip://{parent}#{path}"));
+        }
+        assert_eq!(db.query_row("SELECT file_count,total_bytes FROM models WHERE display_title='King-Thror'", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?, (4, contents.len() as i64 + 21));
+        for t in ["models_fts", "files_fts"] {
+            assert_eq!(db.query_row(&format!("SELECT count(*) FROM {t} WHERE {t} MATCH 'throne'"), [], |r|r.get::<_,i64>(0))?, 1);
+        }
+        Ok(())
+    }).unwrap();
+
+    let mut query = SearchQuery {
+        text: "throne".into(),
+        view_mode: ViewMode::Files,
+        source_filter: SourceFilter::All,
+        source_id: None,
+        folder_id: None,
+        facets: Default::default(),
+        limit: 20,
+        offset: 0,
+    };
+    let result = f.db.search_catalog(&query).unwrap();
+    let SearchItemDto::File(file) = &result.items[0] else {
+        panic!("wrong view");
+    };
+    assert_eq!(
+        file.rel_path,
+        "2025_03_King-Thror_32mm.zip/inside/Throne.stl"
+    );
+    assert_eq!(
+        file.parent_archive_name.as_deref(),
+        Some("2025_03_King-Thror_32mm.zip")
+    );
+    let detail = f.db.get_model_detail(file.model_id.unwrap()).unwrap();
+    assert_eq!(
+        detail
+            .files
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "2025_03_King-Thror_32mm.zip",
+            "inside/Throne.stl",
+            "nested.zip",
+            "photo.png"
+        ]
+    );
+
+    zip(&archive, &["new/Replacement.3mf", "photo.png"]);
+    run_scan(
+        &f.db,
+        f.source,
+        &inspector,
+        &CancellationToken::new(),
+        &mut Events::default(),
+    )
+    .unwrap();
+    assert_eq!(f.db.search_catalog(&query).unwrap().total_files, 0);
+    assert_eq!(f.db.search_catalog(&query).unwrap().total_models, 0);
+    query.text = "replacement".into();
+    let replacement = f.db.search_catalog(&query).unwrap();
+    assert_eq!((replacement.total_models, replacement.total_files), (1, 1));
+    assert_eq!(f.db.get_model_detail(detail.id).unwrap().file_count, 3);
+}
+
+#[test]
+fn metadata_is_checked_again_before_opening_a_previously_resident_zip() {
+    struct BecomesPlaceholder(AtomicUsize);
+    impl EntryMetadataInspector for BecomesPlaceholder {
+        fn inspect(&self, path: &Path) -> io::Result<EntryMetadata> {
+            let mut metadata = OsMetadataInspector.inspect(path)?;
+            if path.ends_with("changed.zip") {
+                let seen = self.0.fetch_add(1, Relaxed);
+                if seen > 0 {
+                    metadata.flags.file_attributes = 0x0040_0000;
+                }
+            }
+            Ok(metadata)
+        }
+    }
+    let f = Fixture::new();
+    zip(&f.root.join("changed.zip"), &["member.stl"]);
+    let inspector = BecomesPlaceholder(AtomicUsize::new(0));
+    let stats = run_scan(
+        &f.db,
+        f.source,
+        &inspector,
+        &CancellationToken::new(),
+        &mut Events::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            stats.models_indexed,
+            stats.files_indexed,
+            stats.errors_count
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(inspector.0.load(Relaxed), 2);
+    assert_eq!(model(&f, "changed.zip").1, None);
+}
+
+fn scan(f: &Fixture, inspector: &(impl EntryMetadataInspector + Sync)) {
+    run_scan(
+        &f.db,
+        f.source,
+        inspector,
+        &CancellationToken::new(),
+        &mut Events::default(),
+    )
+    .unwrap();
+}
+
+fn model(f: &Fixture, name: &str) -> (i64, Option<String>) {
+    f.db.with_reader(|db| {
+        Ok(db.query_row(
+            "SELECT id, fingerprint FROM models WHERE raw_name=?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    })
+    .unwrap()
+}
+
+fn count(f: &Fixture, sql: &str) -> i64 {
+    f.db.with_reader(|db| Ok(db.query_row(sql, [], |r| r.get(0))?))
+        .unwrap()
+}
+
+#[test]
+fn unchanged_residents_never_reach_the_hash_open_guard() {
+    struct CountInspections(AtomicUsize);
+    impl EntryMetadataInspector for CountInspections {
+        fn inspect(&self, path: &Path) -> io::Result<EntryMetadata> {
+            if path.ends_with("mesh.stl") {
+                self.0.fetch_add(1, Relaxed);
+            }
+            OsMetadataInspector.inspect(path)
+        }
+    }
+    let f = Fixture::new();
+    let inspector = CountInspections(AtomicUsize::new(0));
+    let hash = || {
+        f.db.with_reader(|db| {
+            Ok(db.query_row(
+                "SELECT content_hash FROM files WHERE filename='mesh.stl' AND index_pass=2",
+                [],
+                |r| r.get::<_, String>(0),
+            )?)
+        })
+        .unwrap()
+    };
+    let set_time = |elapsed| {
+        fs::File::options()
+            .write(true)
+            .open(f.root.join("mesh.stl"))
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(elapsed))
+            .unwrap();
+    };
+    f.file("mesh.stl", b"first");
+    set_time(1000);
+    scan(&f, &inspector);
+    assert_eq!(hash(), blake3::hash(b"first").to_hex().as_str());
+    assert_eq!(inspector.0.swap(0, Relaxed), 2); // Inventory and guarded data open.
+    scan(&f, &inspector);
+    assert_eq!(inspector.0.swap(0, Relaxed), 1); // Inventory only.
+    assert_eq!(hash(), blake3::hash(b"first").to_hex().as_str());
+    f.file("mesh.stl", b"other");
+    set_time(1001); // Same length, different mtime.
+    scan(&f, &inspector);
+    assert_eq!(inspector.0.swap(0, Relaxed), 2);
+    assert_eq!(hash(), blake3::hash(b"other").to_hex().as_str());
+    f.file("mesh.stl", b"longer");
+    set_time(1001); // Same mtime, different length.
+    scan(&f, &inspector);
+    assert_eq!(inspector.0.load(Relaxed), 2);
+    assert_eq!(hash(), blake3::hash(b"longer").to_hex().as_str());
+}
+
+#[test]
+fn moving_pack_and_zip_preserves_model_ids_and_refreshes_both_search_indexes() {
+    let f = Fixture::new();
+    f.file("Obsidian/head.stl", b"head");
+    f.file("Obsidian/body.stl", b"body");
+    zip(&f.root.join("Garnet.zip"), &["inside/Throne.stl"]);
+    scan(&f, &OsMetadataInspector);
+    let pack = model(&f, "Obsidian");
+    let archive = model(&f, "Garnet.zip");
+    fs::create_dir(f.root.join("destination")).unwrap();
+    fs::rename(f.root.join("Obsidian"), f.root.join("destination/Emerald")).unwrap();
+    fs::rename(
+        f.root.join("destination/Emerald/head.stl"),
+        f.root.join("destination/Emerald/z_head.stl"),
+    )
+    .unwrap();
+    fs::rename(
+        f.root.join("Garnet.zip"),
+        f.root.join("destination/Sapphire.zip"),
+    )
+    .unwrap();
+    scan(&f, &OsMetadataInspector);
+    assert_eq!(model(&f, "Emerald"), pack);
+    assert_eq!(model(&f, "Sapphire.zip"), archive);
+    assert!(pack.1.is_some() && archive.1.is_some());
+    for table in ["models_fts", "files_fts"] {
+        assert_eq!(
+            count(
+                &f,
+                &format!("SELECT count(*) FROM {table} WHERE {table} MATCH 'obsidian OR garnet'")
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &f,
+                &format!("SELECT count(*) FROM {table} WHERE {table} MATCH 'sapphire AND throne'")
+            ),
+            1
+        );
+    }
+    let detail = f.db.get_model_detail(archive.0).unwrap();
+    assert!(detail.canonical_uri.ends_with("destination/Sapphire.zip"));
+    let entry = detail
+        .files
+        .iter()
+        .find(|file| file.rel_path == "inside/Throne.stl")
+        .unwrap();
+    let parent = detail
+        .files
+        .iter()
+        .find(|file| file.rel_path == "Sapphire.zip")
+        .unwrap();
+    assert_eq!(entry.parent_archive_id, Some(parent.id));
+    assert_eq!(count(&f, "SELECT count(*) FROM models"), 2);
+    assert_eq!(count(&f, "SELECT count(*) FROM files"), 4);
+}
+
+#[test]
+fn duplicate_and_null_fingerprints_do_not_reuse_model_ids() {
+    let f = Fixture::new();
+    for name in ["one/first.stl", "two/second.stl", "cloud.stl"] {
+        f.file(name, b"identical");
+    }
+    let inspector = MockMetadataInspector::new(["cloud.stl", "moved-cloud.stl"].map(|p| {
+        (
+            f.root.join(p),
+            RawWin32AttrFlags {
+                file_attributes: 0x1000,
+                is_symlink: false,
+                reparse_tag: None,
+            },
+        )
+    }));
+    scan(&f, &inspector);
+    let first = model(&f, "first.stl");
+    let second = model(&f, "second.stl");
+    let cloud = model(&f, "cloud.stl");
+    assert_eq!(first.1, second.1);
+    assert!(first.1.is_some());
+    assert_eq!(cloud.1, None);
+    fs::remove_file(f.root.join("one/first.stl")).unwrap();
+    fs::rename(f.root.join("two/second.stl"), f.root.join("two/copy.stl")).unwrap();
+    fs::rename(f.root.join("cloud.stl"), f.root.join("moved-cloud.stl")).unwrap();
+    scan(&f, &inspector);
+    assert!(![first.0, second.0].contains(&model(&f, "copy.stl").0));
+    let moved_cloud = model(&f, "moved-cloud.stl");
+    assert_eq!(moved_cloud.1, None);
+    assert_ne!(moved_cloud.0, cloud.0);
+    assert_eq!(count(&f, "SELECT count(*) FROM models"), 2);
+}
+
+#[test]
+fn accessible_deletions_prune_history_but_unavailable_root_does_not() {
+    let f = Fixture::new();
+    f.file("lost/a.stl", b"a");
+    f.file("lost/b.stl", b"b");
+    f.file("lost/photo.jpg", b"c");
+    zip(&f.root.join("gone.zip"), &["entry.stl"]);
+    scan(&f, &OsMetadataInspector);
+    let parked = f.root.with_file_name("parked");
+    fs::rename(&f.root, &parked).unwrap();
+    scan(&f, &OsMetadataInspector);
+    assert_eq!(count(&f, "SELECT count(*) FROM files"), 5);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM sources WHERE status='unavailable'"
+        ),
+        1
+    );
+    fs::rename(parked, &f.root).unwrap();
+    fs::remove_dir_all(f.root.join("lost")).unwrap();
+    fs::remove_file(f.root.join("gone.zip")).unwrap();
+    scan(&f, &OsMetadataInspector);
+    for table in ["models", "files", "models_fts", "files_fts"] {
+        assert_eq!(
+            count(&f, &format!("SELECT count(*) FROM {table}")),
+            0,
+            "{table}"
+        );
+    }
+    assert_eq!(count(&f, "SELECT count(*) FROM folders"), 1);
+}
+
+#[test]
+fn excluded_junction_does_not_block_pack_folding_or_fingerprints() {
+    let f = Fixture::new();
+    f.file("Pack/a.stl", b"a");
+    f.file("Pack/b.stl", b"b");
+    f.file("Pack/STL/ignored.stl", b"not a member");
+    let junction = RawWin32AttrFlags {
+        file_attributes: 0x0400,
+        is_symlink: false,
+        reparse_tag: Some(0xa000_0003),
+    };
+    let inspector = MockMetadataInspector::new([(f.root.join("Pack/STL"), junction)]);
+    scan(&f, &inspector);
+    assert!(
+        f.db.get_folder_tree(SourceFilter::All).unwrap()[0]
+            .children
+            .is_empty(),
+        "a new pack folds despite its excluded junction child"
+    );
+    let (id, first_hash) = model(&f, "Pack");
+    assert!(first_hash.is_some());
+
+    f.file("Pack/c.stl", b"c");
+    scan(&f, &inspector);
+    assert_eq!(count(&f, "SELECT count(*) FROM models"), 1);
+    assert_eq!(count(&f, "SELECT file_count FROM models"), 3);
+    let (same_id, updated_hash) = model(&f, "Pack");
+    assert_eq!(same_id, id);
+    assert!(updated_hash.is_some());
+    assert_ne!(updated_hash, first_hash);
+
+    fs::rename(f.root.join("Pack"), f.root.join("Moved")).unwrap();
+    let inspector = MockMetadataInspector::new([(f.root.join("Moved/STL"), junction)]);
+    scan(&f, &inspector);
+    assert_eq!(model(&f, "Moved"), (id, updated_hash));
+}
+
+#[test]
+fn excluded_junction_protects_history_without_blocking_unrelated_pruning() {
+    let f = Fixture::new();
+    f.file("History/hidden.stl", b"keep");
+    f.file("unrelated.stl", b"prune");
+    scan(&f, &OsMetadataInspector);
+    let historical = model(&f, "hidden.stl");
+    fs::remove_file(f.root.join("History/hidden.stl")).unwrap();
+    fs::remove_file(f.root.join("unrelated.stl")).unwrap();
+    f.file("copy.stl", b"keep");
+    let inspector = MockMetadataInspector::new([(
+        f.root.join("History"),
+        RawWin32AttrFlags {
+            file_attributes: 0x0400,
+            is_symlink: false,
+            reparse_tag: Some(0xa000_0003),
+        },
+    )]);
+    scan(&f, &inspector);
+    assert_eq!(model(&f, "hidden.stl"), historical);
+    let copy = model(&f, "copy.stl");
+    assert_ne!(copy.0, historical.0, "do not borrow the protected model ID");
+    assert_eq!(
+        copy.1, historical.1,
+        "fingerprint observed standalone files"
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM files WHERE filename='unrelated.stl'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn partial_walk_finalizes_visible_moves_without_borrowing_hidden_ids_or_fingerprints() {
+    for inaccessible in [false, true] {
+        let f = Fixture::new();
+        f.file("visible/old.stl", b"unique");
+        f.file("opaque/hidden.stl", b"duplicate");
+        zip(&f.root.join("opaque/history.zip"), &["preserved.stl"]);
+        f.file("assembly/body.stl", b"body");
+        f.file("assembly/head.stl", b"head");
+        f.file("assembly/STL/base.stl", b"base");
+        scan(&f, &OsMetadataInspector);
+        let old = model(&f, "old.stl");
+        let hidden = model(&f, "hidden.stl");
+        let pack = model(&f, "assembly");
+        fs::rename(
+            f.root.join("visible/old.stl"),
+            f.root.join("visible/new.stl"),
+        )
+        .unwrap();
+        f.file("visible/copy.zip", b"invalid zip");
+        f.file("copy/duplicate.stl", b"duplicate");
+
+        struct Partial(bool);
+        impl EntryMetadataInspector for Partial {
+            fn inspect(&self, path: &Path) -> io::Result<EntryMetadata> {
+                let mut data = OsMetadataInspector.inspect(path)?;
+                if path.ends_with("opaque") || path.ends_with("assembly/STL") {
+                    if self.0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "fixture denied",
+                        ));
+                    }
+                    data.flags.file_attributes = 0x1000;
+                }
+                Ok(data)
+            }
+        }
+        let mut events = Events::default();
+        run_scan(
+            &f.db,
+            f.source,
+            &Partial(inaccessible),
+            &CancellationToken::new(),
+            &mut events,
+        )
+        .unwrap();
+        let source = &f.db.list_sources().unwrap()[0];
+        let diagnostic = source.last_error.as_deref().unwrap();
+        assert!(diagnostic.contains("copy.zip"));
+        assert!(diagnostic.contains(if inaccessible {
+            "fixture denied"
+        } else {
+            "Online-Only"
+        }));
+        assert_eq!(model(&f, "new.stl"), old);
+        assert_eq!(model(&f, "hidden.stl"), hidden);
+        assert_eq!(model(&f, "assembly"), pack);
+        assert_ne!(model(&f, "duplicate.stl").0, hidden.0);
+        assert!(model(&f, "duplicate.stl").1.is_some());
+        assert_eq!(count(&f, "SELECT count(*) FROM files WHERE filename='hidden.stl' AND storage_state='local_resident'"), 1);
+        assert_eq!(
+            count(&f, "SELECT count(*) FROM files WHERE filename='old.stl'"),
+            0
+        );
+        assert_eq!(
+            count(
+                &f,
+                "SELECT recursive_model_count FROM folders WHERE rel_path=''"
+            ),
+            6
+        );
+        assert_eq!(count(&f, "SELECT count(*) FROM files WHERE filename='preserved.stl' AND storage_state='zip_entry'"), 1);
+        assert_eq!(
+            count(
+                &f,
+                "SELECT file_count FROM models WHERE raw_name='assembly'"
+            ),
+            3
+        );
+    }
+}
+
+#[test]
+fn partial_root_preserves_its_direct_pack_and_keeps_technical_children_separate() {
+    struct DenyRootFile;
+    impl EntryMetadataInspector for DenyRootFile {
+        fn inspect(&self, path: &Path) -> io::Result<EntryMetadata> {
+            if path.ends_with("part.stl") {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            OsMetadataInspector.inspect(path)
+        }
+    }
+    let f = Fixture::new();
+    f.file("part.stl", b"part");
+    f.file("cover.png", b"image");
+    f.file("STL/head.stl", b"head");
+    scan(&f, &OsMetadataInspector);
+    let pack = model(&f, "Test library");
+    assert!(pack.1.is_some());
+    scan(&f, &DenyRootFile);
+    assert_eq!(model(&f, "Test library"), pack);
+    assert_eq!(count(&f, "SELECT count(*) FROM models"), 2);
+    assert_eq!(f.db.get_model_detail(pack.0).unwrap().files.len(), 2);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM folders WHERE rel_path='STL' AND is_visible=1"
+        ),
+        1
+    );
+}
+
+#[test]
+fn a_partial_walk_preserves_legacy_root_ownership_until_full_regrouping() {
+    struct DenyReadme;
+    impl EntryMetadataInspector for DenyReadme {
+        fn inspect(&self, path: &Path) -> io::Result<EntryMetadata> {
+            if path.ends_with("README.md") {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            OsMetadataInspector.inspect(path)
+        }
+    }
+    let f = Fixture::new();
+    f.file("README.md", b"legacy root marker");
+    f.file("STL/head.stl", b"legacy");
+    f.file("STL/body.stl", b"legacy two");
+    scan(&f, &OsMetadataInspector);
+    f.db.with_writer(|db| {
+        // Reproduce ownership written by the pre-change root absorption rule.
+        db.execute_batch("UPDATE models SET canonical_uri=(SELECT root_uri FROM sources),
+                folder_id=(SELECT id FROM folders WHERE rel_path=''),raw_name='Test library',display_title='Test library';
+            UPDATE files SET folder_id=(SELECT id FROM folders WHERE rel_path=''),rel_path='STL/' || filename;
+            DELETE FROM folders WHERE rel_path='STL';")?;
+        Ok(())
+    }).unwrap();
+    let legacy = model(&f, "Test library");
+    scan(&f, &DenyReadme);
+    assert_eq!(model(&f, "Test library"), legacy);
+    assert_eq!(f.db.get_model_detail(legacy.0).unwrap().files.len(), 2);
+    assert_eq!(count(&f, "SELECT count(*) FROM models"), 1);
+    scan(&f, &OsMetadataInspector);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM models WHERE raw_name='Test library'"
+        ),
+        0
+    );
+    assert_eq!(
+        f.db.get_model_detail(model(&f, "STL").0)
+            .unwrap()
+            .files
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn root_going_offline_during_partial_walk_blocks_move_finalization() {
+    struct Monitor<'a> {
+        root: &'a Path,
+        offline: AtomicBool,
+    }
+    impl EntryMetadataInspector for Monitor<'_> {
+        fn inspect(&self, path: &Path) -> io::Result<EntryMetadata> {
+            let mut data = OsMetadataInspector.inspect(path)?;
+            if path.ends_with("opaque") || (path == self.root && self.offline.load(Relaxed)) {
+                data.flags.file_attributes = 0x1000;
+            }
+            Ok(data)
+        }
+    }
+    struct Disconnect<'a>(&'a AtomicBool);
+    impl PipelineSink for Disconnect<'_> {
+        fn progress(&mut self, event: IndexerProgressEvent) {
+            if event.pass == IndexerPass::Metadata {
+                self.0.store(true, Relaxed);
+            }
+        }
+        fn batch_updated(&mut self, _: IndexerBatchUpdatedEvent) {}
+        fn error(&mut self, event: IndexerErrorEvent) {
+            assert!(event.recoverable);
+        }
+    }
+
+    let f = Fixture::new();
+    f.file("old.stl", b"original");
+    f.file("opaque/hidden.stl", b"hidden");
+    scan(&f, &OsMetadataInspector);
+    let original = model(&f, "old.stl");
+    let hidden = model(&f, "hidden.stl");
+    let last_scan = f.db.list_sources().unwrap()[0].last_scan_at;
+    fs::rename(f.root.join("old.stl"), f.root.join("new.stl")).unwrap();
+    let monitor = Monitor {
+        root: &f.root,
+        offline: AtomicBool::new(false),
+    };
+    run_scan(
+        &f.db,
+        f.source,
+        &monitor,
+        &CancellationToken::new(),
+        &mut Disconnect(&monitor.offline),
+    )
+    .unwrap();
+    assert_eq!(model(&f, "old.stl"), original);
+    assert_eq!(model(&f, "hidden.stl"), hidden);
+    assert_eq!(model(&f, "new.stl").1, None);
+    let source = &f.db.list_sources().unwrap()[0];
+    assert_eq!(source.status, SourceStatus::Unavailable);
+    assert_eq!(source.last_scan_at, last_scan);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM files WHERE filename='new.stl' AND content_hash IS NULL"
+        ),
+        1
+    );
+}
+
+#[test]
+fn unchanged_rescan_does_not_rewrite_fts_and_regrouping_updates_it() {
+    let f = Fixture::new();
+    for i in 0..1000 {
+        f.file(&format!("Pack/STL/mesh{i}.stl"), b"mesh");
+        f.file(&format!("solo{i}.stl"), b"solo");
+    }
+    zip(&f.root.join("archive.zip"), &["zipMember.stl"]);
+    scan(&f, &OsMetadataInspector);
+    // Observe actual FTS content writes, not changes to inventory metadata.
+    f.db.with_writer(|conn| {
+        Ok(conn.execute_batch("CREATE TEMP TABLE fts_writes (kind TEXT);
+            CREATE TEMP TRIGGER models_fts_insert AFTER INSERT ON models_fts_content BEGIN INSERT INTO fts_writes VALUES ('model'); END;
+            CREATE TEMP TRIGGER models_fts_delete AFTER DELETE ON models_fts_content BEGIN INSERT INTO fts_writes VALUES ('model'); END;
+            CREATE TEMP TRIGGER files_fts_insert AFTER INSERT ON files_fts_content BEGIN INSERT INTO fts_writes VALUES ('file'); END;
+            CREATE TEMP TRIGGER files_fts_delete AFTER DELETE ON files_fts_content BEGIN INSERT INTO fts_writes VALUES ('file'); END;")?)
+    }).unwrap();
+    let start = std::time::Instant::now();
+    scan(&f, &OsMetadataInspector);
+    let writes =
+        f.db.with_writer(|conn| {
+            Ok(conn.query_row("SELECT count(*) FROM fts_writes", [], |r| {
+                r.get::<_, i64>(0)
+            })?)
+        })
+        .unwrap();
+    eprintln!(
+        "unchanged rescan of 2002 files: {:?}, FTS content writes: {writes}",
+        start.elapsed()
+    );
+    assert_eq!(writes, 0);
+
+    let id = model(&f, "Pack").0;
+    fs::rename(f.root.join("Pack"), f.root.join("Renamed")).unwrap();
+    scan(&f, &OsMetadataInspector);
+    assert_eq!(model(&f, "Renamed").0, id);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM models_fts WHERE models_fts MATCH 'Renamed'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM models_fts WHERE models_fts MATCH 'Pack'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM files_fts WHERE files_fts MATCH 'Renamed'"
+        ),
+        1000
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM files_fts WHERE files_fts MATCH 'Pack'"
+        ),
+        0
+    );
+    assert_eq!(count(&f, "SELECT count(*) FROM files_fts i JOIN files f ON i.rowid=f.id WHERE i.model_id IS NOT f.model_id"), 0);
+}
+
+#[test]
+fn incomplete_or_cancelled_scans_cannot_prune_unobserved_history() {
+    let f = Fixture::new();
+    f.file("was/old.stl", b"old");
+    f.file("opaque/hidden.stl", b"hidden");
+    zip(&f.root.join("switch.zip"), &["former.stl"]);
+    scan(&f, &OsMetadataInspector);
+    assert!(model(&f, "switch.zip").1.is_some());
+    let old = model(&f, "old.stl");
+    let hidden = model(&f, "hidden.stl");
+    fs::remove_file(f.root.join("was/old.stl")).unwrap();
+    let inspector = MockMetadataInspector::new(["opaque", "switch.zip"].map(|name| {
+        (
+            f.root.join(name),
+            RawWin32AttrFlags {
+                file_attributes: 0x1000,
+                is_symlink: false,
+                reparse_tag: None,
+            },
+        )
+    }));
+    scan(&f, &inspector);
+    assert_eq!(model(&f, "old.stl"), old);
+    assert_eq!(model(&f, "hidden.stl"), hidden);
+    assert_eq!(model(&f, "switch.zip").1, None);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM files_fts WHERE files_fts MATCH 'former'"
+        ),
+        0
+    );
+
+    struct CancelAtPassTwo(CancellationToken);
+    impl PipelineSink for CancelAtPassTwo {
+        fn progress(&mut self, event: IndexerProgressEvent) {
+            if event.pass == IndexerPass::Metadata {
+                self.0.cancel();
+            }
+        }
+        fn batch_updated(&mut self, _: IndexerBatchUpdatedEvent) {}
+        fn error(&mut self, error: IndexerErrorEvent) {
+            panic!("unexpected scan error: {}", error.message);
+        }
+    }
+    let cancel = CancellationToken::new();
+    let stats = run_scan(
+        &f.db,
+        f.source,
+        &OsMetadataInspector,
+        &cancel,
+        &mut CancelAtPassTwo(cancel.clone()),
+    )
+    .unwrap();
+    assert!(stats.cancelled);
+    assert_eq!(model(&f, "old.stl"), old);
+    scan(&f, &OsMetadataInspector);
+    assert_eq!(count(&f, "SELECT count(*) FROM models"), 2);
+    assert_eq!(model(&f, "hidden.stl"), hidden);
+}
+
+#[test]
+fn partial_scan_self_heals_legacy_subpack_rows_after_recursive_absorption() {
+    let f = Fixture::new();
+    f.file("Remote/hidden.stl", b"hidden");
+    f.file("Dwarven Ghouls/Dwarven_Ghouls.jpg", b"cover");
+    f.file("Dwarven Ghouls/Supported/A/a1.stl", b"a1");
+    f.file("Dwarven Ghouls/Supported/A/a2.stl", b"a2");
+    f.file("Dwarven Ghouls/Supported/B/b1.stl", b"b1");
+    f.file("Dwarven Ghouls/Supported/B/b2.stl", b"b2");
+    scan(&f, &OsMetadataInspector);
+    let remote = model(&f, "hidden.stl");
+
+    // Simulate pre-upgrade historical DB where Supported/A and Supported/B were separate folder_packs
+    f.db.with_writer(|conn| {
+        conn.execute_batch(
+            "DELETE FROM files WHERE uri LIKE '%/Dwarven Ghouls/%';
+             DELETE FROM models WHERE canonical_uri LIKE '%/Dwarven Ghouls%';
+             DELETE FROM folders WHERE rel_path LIKE 'Dwarven Ghouls%';
+             INSERT INTO folders (source_id, parent_id, rel_path, name, is_visible)
+               SELECT 1, (SELECT id FROM folders WHERE rel_path=''), 'Dwarven Ghouls', 'Dwarven Ghouls', 1;
+             INSERT INTO folders (source_id, parent_id, rel_path, name, is_visible)
+               SELECT 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls'), 'Dwarven Ghouls/Supported', 'Supported', 1;
+             INSERT INTO models (id, source_id, folder_id, container_kind, canonical_uri, raw_name, display_title, primary_ext, file_count, total_bytes, updated_at) VALUES
+               (201, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), 'folder_pack', (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/A', 'A', 'A', 'stl', 2, 4, 0),
+               (202, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), 'folder_pack', (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/B', 'B', 'B', 'stl', 2, 4, 0);
+             INSERT INTO files (model_id, source_id, folder_id, uri, rel_path, filename, ext, storage_state, size_bytes, content_hash, index_pass) VALUES
+               (201, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/A/a1.stl', 'a1.stl', 'a1.stl', 'stl', 'local_resident', 2, 'ha1', 2),
+               (201, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/A/a2.stl', 'a2.stl', 'a2.stl', 'stl', 'local_resident', 2, 'ha2', 2),
+               (202, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/B/b1.stl', 'b1.stl', 'b1.stl', 'stl', 'local_resident', 2, 'hb1', 2),
+               (202, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/B/b2.stl', 'b2.stl', 'b2.stl', 'stl', 'local_resident', 2, 'hb2', 2);"
+        )?;
+        Ok(())
+    }).unwrap();
+
+    // Rescan while Remote is Online-Only (partial scan)
+    let inspector = MockMetadataInspector::new([(
+        f.root.join("Remote"),
+        RawWin32AttrFlags {
+            file_attributes: 0x1000,
+            is_symlink: false,
+            reparse_tag: None,
+        },
+    )]);
+    scan(&f, &inspector);
+
+    // Emptied legacy A/B pack models and folded folders are gone, while Remote history is preserved
+    assert_eq!(count(&f, "SELECT count(*) FROM models"), 2);
+    assert!(model(&f, "Dwarven Ghouls").1.is_some());
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM models WHERE raw_name IN ('A','B')"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM folders WHERE rel_path LIKE 'Dwarven Ghouls%'"
+        ),
+        0
+    );
+    assert_eq!(model(&f, "hidden.stl"), remote);
+}

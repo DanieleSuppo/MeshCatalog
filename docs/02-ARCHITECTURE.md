@@ -20,31 +20,10 @@
 Su Windows, Dropbox in modalità *Smart Sync (Online-Only)* espone i file cloud nel filesystem come *placeholder NTFS*. Se un processo li apre con `File::open`, Windows intercetta la chiamata e **forza il download completo del file su SSD**.
 
 ### 2.1 Scudo Anti-Idratazione su Disco Locale (Win32 Guard)
-Ogni scansione locale su Windows **deve** ispezionare gli attributi NTFS tramite metadati Win32 prima di qualsiasi lettura di byte o calcolo hash:
+Prima di enumerare una directory o aprire un file, lo scanner verifica i metadati Win32, partendo dalla radice del volume e controllando gli antenati. `FindFirstFileW` restituisce attributi e tag reparse senza aprire un handle di lettura dati. Per la radice del volume si usa `GetFileAttributesW`; se manca il tag di una radice reparse, lo scanner la rifiuta.
 
-```rust
-// Costanti Win32 Cloud Files API
-const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
-const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
-
-/// Ritorna true se il file è un placeholder cloud non presente fisicamente su SSD.
-/// Non apre MAI un file handle con accesso in lettura dati.
-pub fn is_online_only_placeholder(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::fs::MetadataExt;
-        let attrs = metadata.file_attributes();
-        (attrs & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) != 0
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = metadata;
-        false
-    }
-}
-```
-
-- **Regola ferrea:** Se `is_online_only_placeholder` restituisce `true`, lo scanner locale registra solo l'esistenza del percorso (se non già gestito dal connettore API Dropbox) e **non apre mai il file** né chiama API Shell Windows per estrarne icone/anteprime.
+- `FILE_ATTRIBUTE_OFFLINE` (`0x0000_1000`), `FILE_ATTRIBUTE_RECALL_ON_OPEN` (`0x0004_0000`) e `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` (`0x0040_0000`) bloccano le aperture dati, l'enumerazione delle cartelle e le anteprime Shell. I segnaposto vengono catalogati con i soli metadati.
+- Tra i reparse point, solo i tag riconosciuti della famiglia `IO_REPARSE_TAG_CLOUD` senza bit di richiamo/offline sono trattati come residenti. Junction, symlink e altri name surrogate non vengono seguiti; un tag mancante/sconosciuto o un errore di lookup non autorizza l'accesso.
 
 ### 2.2 Connettore Diretto Dropbox API v2 (OAuth 2.0 PKCE Locale)
 L'app integra un flusso OAuth 2.0 PKCE nativo desktop (nessun server intermedio; refresh token salvato in modo sicuro nel credential store Windows / config locale):
@@ -119,6 +98,7 @@ CREATE TABLE folders (
     parent_id       INTEGER REFERENCES folders(id) ON DELETE CASCADE,
     rel_path        TEXT NOT NULL,        -- path relativo normalizzato con '/'
     name            TEXT NOT NULL,
+    is_visible      INTEGER NOT NULL DEFAULT 1 CHECK (is_visible IN (0, 1)),
     model_count     INTEGER NOT NULL DEFAULT 0,
     file_count      INTEGER NOT NULL DEFAULT 0,
     hero_thumb_id   INTEGER,
@@ -145,7 +125,7 @@ CREATE TABLE models (
 
 CREATE TABLE files (
     id               INTEGER PRIMARY KEY,
-    model_id         INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    model_id         INTEGER REFERENCES models(id) ON DELETE CASCADE, -- NULL solo per immagini non associate
     source_id        INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     folder_id        INTEGER REFERENCES folders(id) ON DELETE SET NULL,
     parent_archive_id INTEGER REFERENCES files(id) ON DELETE CASCADE, -- valorizzato se dentro uno .zip
@@ -165,7 +145,10 @@ CREATE TABLE files (
     bbox_y_mm        REAL,
     bbox_z_mm        REAL,
     thumb_id         INTEGER,
-    index_pass       INTEGER NOT NULL DEFAULT 1 -- 1=tree, 2=meta/tax, 3=geometry/render
+    index_pass       INTEGER NOT NULL DEFAULT 1, -- 1=tree, 2=meta/tax, 3=geometry/render
+    CHECK (model_id IS NOT NULL OR (
+        ext IN ('jpg', 'jpeg', 'png', 'webp') AND parent_archive_id IS NULL AND storage_state <> 'zip_entry'
+    ))
 );
 
 CREATE INDEX idx_files_hash ON files(content_hash) WHERE content_hash IS NOT NULL;

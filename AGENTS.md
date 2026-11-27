@@ -21,10 +21,8 @@ Qualsiasi modifica futura **deve rispettare** questi 4 vincoli strutturali:
    - L'indicizzatore e la UI **non devono mai** modificare, spostare, rinominare o scrivere file nascosti/sidecar dentro le cartelle dei modelli 3D dell'utente.
    - Tutto lo stato applicativo (database SQLite, cache miniature `.webp`, log e token OAuth locali) risiede esclusivamente nella directory dati dell'applicazione (`%LOCALAPPDATA%\MeshCatalog`).
 2. **Dropbox Anti-Hydration Guard (Zero-Explosion):**
-   - Su Windows, prima di aprire *qualsiasi* file su disco per hashing, parsing o estrazione ZIP, verificare gli attributi Win32 tramite `std::fs::metadata` / `GetFileAttributesW` **senza aprire file handle**:
-     - `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` (`0x00400000`)
-     - `FILE_ATTRIBUTE_OFFLINE` (`0x00001000`)
-   - Se uno dei due bit è attivo, il file è un segnaposto *Online-Only*: **è severamente vietato chiamare `File::open` o invocare API Shell di Windows per le thumbnail**, perché forzerebbero Dropbox a scaricare centinaia di GB sul disco locale.
+   - Prima di enumerare cartelle o aprire file su Windows, verificare attributi e tag reparse con lookup Win32 di soli metadati, inclusi radice e antenati. Vedere [guard Win32](./docs/02-ARCHITECTURE.md#21-scudo-anti-idratazione-su-disco-locale-win32-guard).
+   - Con `OFFLINE`, `RECALL_ON_OPEN` o `RECALL_ON_DATA_ACCESS`, non enumerare la cartella e non chiamare `File::open` né API Shell per le thumbnail.
    - I file remoti su Dropbox vengono ispezionati esclusivamente tramite le API Dropbox (`list_folder`, `get_thumbnail_batch`, `HTTP Range` sulla Central Directory degli `.zip`/`.3mf`).
 3. **Zero-Latency Browsing (Separazione 2D / 3D):**
    - La navigazione nelle griglie, alberi cartelle, ricerche e filtri legge **esclusivamente** SQLite e la cache locale di miniature `.webp`. Budget target per frame di scorrimento: **`< 16 ms`**.

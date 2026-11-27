@@ -2,17 +2,21 @@
 target/
 src-tauri/target/
 src-tauri/gen/schemas/
-**/*.rs.bk
-Cargo.lock
+*.rs.bk
+*.rlib
+*.prof*
 
 # Node / Frontend
 node_modules/
 dist/
 dist-ssr/
+build/
 .vite/
 *.local
 
 # Runtime local data & caches
+*.log
+*.tmp
 *.db
 *.db-wal
 *.db-shm

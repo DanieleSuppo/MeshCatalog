@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MeshCatalog · Catalogo sintetico di test</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import { mockIPC } from '@tauri-apps/api/mocks';
+      import { catalogFixture } from './catalog.mjs';
+      mockIPC(catalogFixture, { shouldMockEvents: true });
+      await import('/src/main.tsx');
+    </script>
+  </body>
+</html>

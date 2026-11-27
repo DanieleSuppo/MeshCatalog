@@ -1,0 +1,27 @@
+[package]
+name = "meshcatalog-app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = [".", "crates/meshcatalog-core"]
+resolver = "2"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+meshcatalog-core = { path = "crates/meshcatalog-core" }
+tauri = "2"
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
