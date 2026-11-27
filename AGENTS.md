@@ -8,8 +8,8 @@
 - **Obiettivo:** Applicazione desktop **Windows (10/11)** 100% locale e gratuita per trovare, catalogare automaticamente e visualizzare molto velocemente grandi collezioni di file per stampa 3D (~700 GB distribuiti tra SSD interno e Dropbox, inclusi archivi `.zip`).
 - **Stack scelto:** **Tauri v2** (Backend **Rust** + **SQLite `FTS5`** + headless renderer **`wgpu`**) e Frontend **React + TypeScript + Vite + Three.js (`@react-three/fiber`)**.
 - **Workflow di sviluppo cross-OS:**
-  - Il codice e le specifiche vengono sviluppati e committati da **WSL2 (Linux)**.
-  - Il repository GitHub (`DanieleSuppo/MeshCatalog`) funge da ponte verso **Windows**, dove viene eseguito `git pull`, compilato e testato il binario Tauri target (`x86_64-pc-windows-msvc`).
+  - **WSL2 (Linux):** sviluppo, progettazione Spec Kit, verifica del crate puro `meshcatalog-core` (`cargo fmt --check`, `cargo clippy --locked --manifest-path src-tauri/Cargo.toml -p meshcatalog-core --all-targets -- -D warnings`, `cargo test --locked --manifest-path src-tauri/Cargo.toml -p meshcatalog-core`) e test/build frontend (`npm test`, `npm run build` con **Node.js LTS `>= 22.12.0`**). Il crate binario `meshcatalog-app` (GUI Tauri) viene compilato e testato direttamente sul target nativo Windows senza richiedere WebKitGTK su WSL2.
+  - **Ponte GitHub (`DanieleSuppo/MeshCatalog`) -> Windows 10/11 (`x86_64-pc-windows-msvc`):** su Windows clonare e compilare **sempre su NTFS locale fuori da cartelle sincronizzate Dropbox** (es. `C:\Dev\MeshCatalog` o `C:\Users\<utente>\MeshCatalog\git`) per evitare file-lock `EBUSY` su `node_modules` e `src-tauri\target`.
 
 ---
 
@@ -55,12 +55,31 @@ Qualsiasi modifica futura **deve rispettare** questi 4 vincoli strutturali:
 
 ## 5. Workflow Spec Kit (Spec-Driven Development)
 
-Lo sviluppo delle milestone segue il workflow **GitHub Spec Kit** (`specify`, integrazione Antigravity in `.agents/skills/speckit-*` e infrastruttura in `.specify/`):
+Lo sviluppo delle milestone segue il workflow **GitHub Spec Kit** (`specify`, integrazione in `.agents/skills/speckit-*` e infrastruttura in `.specify/`):
 
 - **Costituzione di progetto:** [Spec Kit constitution](./.specify/memory/constitution.md) — codifica gli invarianti non negoziabili (Principi I–V) validati ad ogni gate `/speckit-plan` e `/speckit-analyze`.
 - **Specifiche operative di milestone:** [Working specifications](./specs) — artefatti Spec Kit per ciascuna milestone (`spec.md`, `plan.md`, `tasks.md`).
 - **Architettura Master vs Specifiche di Milestone:**
   - `docs/01..05` contengono la specifica master globale (DDL SQLite completo, matrice formati, contratti IPC, roadmap `M1`–`M5`).
-  - `specs/NNN-<milestone>/` ospita gli artefatti operativi generati per ciascuna milestone (`/speckit-specify` $\rightarrow$ `/speckit-plan` $\rightarrow$ `/speckit-tasks` $\rightarrow$ `/speckit-analyze` $\rightarrow$ `/speckit-implement`).
+  - `specs/NNN-<milestone>/` ospita gli artefatti operativi generati per ciascuna milestone (`/speckit-specify` $\rightarrow$ `/speckit-clarify` $\rightarrow$ `/speckit-plan` $\rightarrow$ `/speckit-tasks` $\rightarrow$ `/speckit-analyze` $\rightarrow$ **STOP** $\rightarrow$ `/speckit-implement`).
 - **Granularità:** Usare Spec Kit per verticali/milestone complete (`M1`..`M4`), non per micro-modifiche ai dizionari o correzioni puntuali.
+
+### 5.1 Fase di Design Spec Kit (Pre-Implementazione)
+
+Quando si progetta una nuova milestone (`M1`..`M4`), seguire rigorosamente questa sequenza:
+
+1. **Setup branch e puntatore locale:** partire da `main` aggiornato, creare il branch `NNN-<milestone>` e impostare `.specify/feature.json` su `{"feature_directory": "specs/NNN-<milestone>"}` (file locale in `.gitignore`).
+2. **Un subagente isolato per ogni step con bootstrap `/ctx`:** eseguire ciascuno step di design in un **subagente dedicato a contesto isolato** (in Antigravity: `invoke_subagent` con `TypeName: "self"`). Ogni subagente **deve come primo passo** inizializzare il contesto tramite la skill `ctx` (`$ctx` / `/ctx`: verifica `.agents/ctx.cache.md` su `git rev-parse HEAD` e, in caso di cache miss, delega la scansione *read-only* a un subagente con modello economico `flash`, mai ereditando silenziosamente il modello principale) e poi eseguire la skill Spec Kit dello step:
+   - **Step 1 — `/speckit-specify`:** genera `specs/NNN-<milestone>/spec.md` e `checklists/requirements.md` (`16/16` PASS).
+   - **Step 2 — `/speckit-clarify` (Gate Interattivo Obbligatorio):** individua solo le ambiguità non già risolte in `AGENTS.md`, nella Costituzione o in `docs/01..05` e pone all'utente **una sola domanda alla volta** in italiano (max 5). **Vietato** procedere a `/speckit-plan` finché `/speckit-clarify` non è completato e le risposte dell'utente non sono registrate in `spec.md` (salvo delega esplicita dell'utente ad applicare le opzioni raccomandate per le domande restanti).
+   - **Step 3 — `/speckit-plan`:** produce `plan.md`, `research.md`, `data-model.md`, `contracts/` e `quickstart.md`, superando il *Constitution Check* (Principi I–V) pre- e post-design.
+   - **Step 4 — `/speckit-tasks`:** genera `tasks.md` ordinato per fasi, dipendenze e User Story con copertura 100% dei requisiti `FR-*` / `SC-*`.
+   - **Step 5 — `/speckit-analyze`:** esegue la verifica *read-only* di allineamento tra `spec.md`, `plan.md`, `tasks.md`, Costituzione e codebase reale; correggere eventuali rilievi `CRITICAL`, `HIGH` o `MEDIUM` e ripetere il re-check *read-only* fino a ottenere **`0 CRITICAL / 0 HIGH / 0 MEDIUM`**.
+3. **Stop obbligatorio prima di `/speckit-implement`:** fare commit e push sul branch `NNN-<milestone>` dei soli artefatti in `specs/NNN-<milestone>/` e **fermarsi senza modificare `src/` o `src-tauri/`**, attendendo che l'utente avvii esplicitamente la fase di implementazione (nella stessa sessione o in un harness dedicato).
+
+### 5.2 Fase di Implementazione, Peer Review e Gate Nativo Windows
+
+1. **Implementazione (`/speckit-implement`):** all'apertura della sessione di implementazione leggere `AGENTS.md` (o eseguire `$ctx`), verificare che `.specify/feature.json` punti a `specs/NNN-<milestone>` (ricreandolo se assente poiché gitignored) ed eseguire i task seguendo `tasks.md`, `plan.md` e `contracts/`.
+2. **Gate automatici WSL2 + Peer Review:** completata l'implementazione, eseguire tutti i check WSL2 (`cargo fmt --check`, `cargo clippy -D warnings` e `cargo test` su `meshcatalog-core`, `npm test`, `npm run build`) seguiti da una **peer review** approfondita del diff rispetto a specifica e invarianti (`ponytail-review`), risolvendo ogni rilievo prima del test Windows.
+3. **Gate nativo Windows 10/11 e chiusura milestone:** fare push sul branch e validare su Windows nativo `cargo test --locked --manifest-path src-tauri/Cargo.toml --workspace --target x86_64-pc-windows-msvc`, `npm run tauri -- dev --target x86_64-pc-windows-msvc -- --locked` e gli scenari reali di `quickstart.md` (**0 byte** scaricati sui segnaposto Dropbox *Online-Only* e rispetto dei budget prestazionali). Registrare l'evidenza in `quickstart.md`, marcare i task completati in `tasks.md`, impostare `Status: Implemented` in `spec.md`, aggiornare `docs/05-ROADMAP.md` ed effettuare il merge della PR in `main` **solo su conferma esplicita dell'utente**.
 
