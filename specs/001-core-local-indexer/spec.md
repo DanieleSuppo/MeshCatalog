@@ -2,7 +2,7 @@
 
 **Feature Branch**: `001-core-local-indexer`  
 **Created**: 2026-11-26  
-**Status**: Draft  
+**Status**: Implemented  
 **Input**: Milestone M1 (`001-core-local-indexer`) — Gestione sorgenti locali in sola lettura, protezione anti-idratazione per placeholder cloud, scoperta trasparente di archivi `.zip` e formati multipli, ri-scansione incrementale resiliente agli spostamenti e shell desktop di navigazione e ricerca istantanea.
 
 ---

@@ -4,9 +4,9 @@
 
 | Fase | Obiettivo Principale | Stato |
 | :--- | :--- | :---: |
-| **M0** | Repository GitHub, `AGENTS.md` e Specifiche complete | **In corso / Completata** |
-| **M1** | Scheletro Tauri v2 + SQLite `FTS5` + Scanner Locale SSD & `.zip` | Prossima |
-| **M2** | Thumbnailer Headless `wgpu` + Estrazione `.3mf`/`.lys` + Viewer 3D On-Demand | Pianificata |
+| **M0** | Repository GitHub, `AGENTS.md` e Specifiche complete | **Completata** |
+| **M1** | Scheletro Tauri v2 + SQLite `FTS5` + Scanner Locale SSD & `.zip` | **Completata** |
+| **M2** | Thumbnailer Headless `wgpu` + Estrazione `.3mf`/`.lys` + Viewer 3D On-Demand | Prossima |
 | **M3** | Motore Tassonomico Automatico + Smart Folder Preview + UI Completa | Pianificata |
 | **M4** | Connettore Dropbox "Zero-Explosion" (`OAuth PKCE` + `HTTP Range` ZIP) | Pianificata |
 | **M5 (v2+)** | Duplicati, "Apri in Bambu Studio / Lychee", AI Vision Locale (CLIP/ONNX) | Futura |

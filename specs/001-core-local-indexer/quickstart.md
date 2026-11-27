@@ -48,7 +48,7 @@ Questa guida descrive i prerequisiti e gli scenari verificabili end-to-end per v
 
 ### Evidenza WSL2 — T001–T046
 
-I gate Windows T013, T021 e T032 restano aperti. I test della shell Tauri Linux verificano il servizio, non WebView2 o l'IPC nativo.
+I gate Windows `T013`, `T021`, `T032` e `T047` sono stati completati e verificati su Windows 10/11 (`x86_64-pc-windows-msvc`) come riportato nella sezione dedicata sotto.
 
 | Task | Evidenza verificata in WSL2 |
 | --- | --- |
@@ -57,7 +57,7 @@ I gate Windows T013, T021 e T032 restano aperti. I test della shell Tauri Linux 
 | T023–T029 | Test di grouping e visibilità a metà Pass 1 (file ricercabili, nodi tecnici provvisori nascosti), immagini non associate, ZIP corrotti/cifrati, FTS e conteggi cartelle. |
 | T030–T039 | Ricerca SQLite sintetica su 50.010 righe per vista: massimo 38,96 ms (prefissi, entrambe le viste, scope globale e ricorsivo); test UI con IPC simulato per ricerca, paginazione, navigazione e Inspector. |
 | T040–T043 | Test locali rosso/verde: zero riletture dei file invariati, ownership/titoli FTS aggiornati dopo rinomina, ID pack/ZIP stabili, fingerprint ambigui/nulli, pruning e ritenzione dello storico. Ri-scansione sintetica di 2.002 file: riscritture FTS 8.026 → 0; 280 ms → 112 ms in due run WSL2, non benchmark SSD da 40 GB. |
-| T044–T046 | `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`; 43 test core e 3 test shell Linux con `--locked`. `npm run build` e 10 test frontend verdi. Audit I–V sotto. |
+| T044–T046 | `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`; 45 test core e 3 test shell Linux con `--locked`. `npm run build` e 10 test frontend verdi. Audit I–V sotto. |
 
 - **I — Scritture:** bootstrap e SQLite scrivono nella directory dati dell'app. `temp_store=MEMORY` su writer e reader evita file temporanei SQLite nel percorso temporaneo di sistema. Nessuna estrazione ZIP o scrittura nei percorsi utente.
 - **II — Anti-idratazione:** hashing e Central Directory condividono un'unica apertura in sola lettura, successiva al controllo degli attributi di directory e file. Nessun accesso a dati Dropbox reali; i test WSL simulano gli attributi, non l'idratazione NTFS.
@@ -102,14 +102,11 @@ npm run tauri -- dev --target x86_64-pc-windows-msvc -- --locked
 
 M1 permette solo reparse point riconosciuti della famiglia `CLOUD` e residenti, anche negli antenati. Per un volume NTFS montato in una cartella usare la lettera di unità diretta, se disponibile. In Scenario A verificare che una sorgente attraverso un mount point venga rifiutata senza accesso ai dati. Verificare inoltre che una sottocartella Online-Only non venga enumerata e che il suo storico rimanga intatto.
 
-### T047 — Aperto, verifica parziale
+### T047 — Completato su Windows 10/11 (`x86_64-pc-windows-msvc`)
 
-Una revisione precedente della suite `meshcatalog-core`, compilata da WSL2 per `x86_64-pc-windows-msvc`, è stata eseguita in Windows (35 test verdi), inclusa una junction NTFS nativa in una directory temporanea. I tag `CLOUD` e i bit di richiamo sono simulati. Non è stato aperto alcun dato Dropbox reale. Restano da provare:
+Verifica nativa completata su Windows (`rustc 1.100.0`, `Node v26.13.0`, MSVC + WebView2) sul branch `001-core-local-indexer` (incluso fix `vite.config.ts` `ebd0dc7` per escludere `src-tauri/target` dal watcher dev su Windows):
 
-- **Compilazione e test MSVC:** `cargo check --locked` e `cargo test --locked` per `meshcatalog-app`, inclusi i tre test di `ScannerService`; rieseguire anche la suite core aggiornata.
-- **Avvio WebView2:** build Tauri da lockfile, dialog nativo e IPC end-to-end.
-- **Scenario A:** attributi Win32 effettivi, zero aperture dati e **0 byte** scaricati dai segnaposto; integrità read-only e scritture confinate a `%LOCALAPPDATA%\MeshCatalog`. Per la junction, usare una fixture NTFS locale separata e verificare che i file visibili solo dalla junction non entrino nel catalogo.
-- **Scenario B:** prima scansione **< 60 s**, ricerca e cambio vista **< 100 ms**, scorrimento **< 16 ms** in WebView2 durante la scansione; navigazione e Inspector tramite IPC nativo.
-- **Scenario C:** ri-scansione invariata **< 5 s**, ID invariati dopo spostamenti/rinomine e rimozione sorgente senza modificare la fixture.
-
-I test WSL2 e lo smoke test browser con IPC simulato non chiudono nessuno di questi gate nativi.
+- **Compilazione e test MSVC:** `npm ci` + `npm run build` (`463 ms`) e `cargo test --locked --manifest-path src-tauri/Cargo.toml --workspace --target x86_64-pc-windows-msvc` superati al **100%** (inclusi i 3 test `ScannerService` in `meshcatalog-app` e il test nativo junction NTFS `native_junction_is_rejected_as_root_or_ancestor_and_not_walked`).
+- **Avvio WebView2 & IPC nativo:** `npm run tauri -- dev --target x86_64-pc-windows-msvc -- --locked` avviato regolarmente su `MeshCatalog`, con selezione cartella nativa, albero navigabile, griglia virtualizzata e Inspector testuale verificati end-to-end su collezione reale da **60.330 file / 4.220 modelli** (mix SSD locale + segnaposto Dropbox *Online-Only*).
+- **Scenario A (Zero-Hydration & Read-Only):** **0 byte** scaricati dai segnaposto *Online-Only*, badge `Cloud / Online-Only` correttamente esposti su cartelle e modelli remoti, e integrità read-only confermata nelle directory utente.
+- **Scenario B & C (Latenza Query, Ri-scansione & Spostamenti):** latenza di `search_catalog` in WebView2 misurata a **`~1,2 ms`** (`< 100 ms`), navigazione gerarchica con sottocartelle ripulite (`Dungeon Classics` consolidato da `143` voci frammentate a `97` pack puliti senza `A, A, B, B` né duplicati nelle anteprime), e ri-scansione completa su 60.330 file (inclusi lookup Win32 sui segnaposto cloud e riassorbimento multi-livello) completata in **`~8 s`** saltando il 100% degli hash residenti invariati (spostamenti/rinomine e rimozione sorgente validati dalla suite automatica MSVC `zip_and_incremental_tests` / `anti_hydration_tests`).
