@@ -872,3 +872,68 @@ fn incomplete_or_cancelled_scans_cannot_prune_unobserved_history() {
     assert_eq!(count(&f, "SELECT count(*) FROM models"), 2);
     assert_eq!(model(&f, "hidden.stl"), hidden);
 }
+
+#[test]
+fn partial_scan_self_heals_legacy_subpack_rows_after_recursive_absorption() {
+    let f = Fixture::new();
+    f.file("Remote/hidden.stl", b"hidden");
+    f.file("Dwarven Ghouls/Dwarven_Ghouls.jpg", b"cover");
+    f.file("Dwarven Ghouls/Supported/A/a1.stl", b"a1");
+    f.file("Dwarven Ghouls/Supported/A/a2.stl", b"a2");
+    f.file("Dwarven Ghouls/Supported/B/b1.stl", b"b1");
+    f.file("Dwarven Ghouls/Supported/B/b2.stl", b"b2");
+    scan(&f, &OsMetadataInspector);
+    let remote = model(&f, "hidden.stl");
+
+    // Simulate pre-upgrade historical DB where Supported/A and Supported/B were separate folder_packs
+    f.db.with_writer(|conn| {
+        conn.execute_batch(
+            "DELETE FROM files WHERE uri LIKE '%/Dwarven Ghouls/%';
+             DELETE FROM models WHERE canonical_uri LIKE '%/Dwarven Ghouls%';
+             DELETE FROM folders WHERE rel_path LIKE 'Dwarven Ghouls%';
+             INSERT INTO folders (source_id, parent_id, rel_path, name, is_visible)
+               SELECT 1, (SELECT id FROM folders WHERE rel_path=''), 'Dwarven Ghouls', 'Dwarven Ghouls', 1;
+             INSERT INTO folders (source_id, parent_id, rel_path, name, is_visible)
+               SELECT 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls'), 'Dwarven Ghouls/Supported', 'Supported', 1;
+             INSERT INTO models (id, source_id, folder_id, container_kind, canonical_uri, raw_name, display_title, primary_ext, file_count, total_bytes, updated_at) VALUES
+               (201, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), 'folder_pack', (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/A', 'A', 'A', 'stl', 2, 4, 0),
+               (202, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), 'folder_pack', (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/B', 'B', 'B', 'stl', 2, 4, 0);
+             INSERT INTO files (model_id, source_id, folder_id, uri, rel_path, filename, ext, storage_state, size_bytes, content_hash, index_pass) VALUES
+               (201, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/A/a1.stl', 'a1.stl', 'a1.stl', 'stl', 'local_resident', 2, 'ha1', 2),
+               (201, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/A/a2.stl', 'a2.stl', 'a2.stl', 'stl', 'local_resident', 2, 'ha2', 2),
+               (202, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/B/b1.stl', 'b1.stl', 'b1.stl', 'stl', 'local_resident', 2, 'hb1', 2),
+               (202, 1, (SELECT id FROM folders WHERE rel_path='Dwarven Ghouls/Supported'), (SELECT root_uri FROM sources)||'/Dwarven Ghouls/Supported/B/b2.stl', 'b2.stl', 'b2.stl', 'stl', 'local_resident', 2, 'hb2', 2);"
+        )?;
+        Ok(())
+    }).unwrap();
+
+    // Rescan while Remote is Online-Only (partial scan)
+    let inspector = MockMetadataInspector::new([(
+        f.root.join("Remote"),
+        RawWin32AttrFlags {
+            file_attributes: 0x1000,
+            is_symlink: false,
+            reparse_tag: None,
+        },
+    )]);
+    scan(&f, &inspector);
+
+    // Emptied legacy A/B pack models and folded folders are gone, while Remote history is preserved
+    assert_eq!(count(&f, "SELECT count(*) FROM models"), 2);
+    assert!(model(&f, "Dwarven Ghouls").1.is_some());
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM models WHERE raw_name IN ('A','B')"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT count(*) FROM folders WHERE rel_path LIKE 'Dwarven Ghouls%'"
+        ),
+        0
+    );
+    assert_eq!(model(&f, "hidden.stl"), remote);
+}

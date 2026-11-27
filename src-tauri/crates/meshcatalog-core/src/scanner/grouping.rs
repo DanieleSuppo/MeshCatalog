@@ -7,6 +7,7 @@ use regex::Regex;
 
 use super::{
     exclusions::supported_extension,
+    title::{is_pose_code, is_pose_explicit},
     walker::{InventoryEntry, WalkCoverage},
 };
 
@@ -26,6 +27,8 @@ pub(crate) fn technical(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "stl"
             | "stls"
+            | "lys"
+            | "3mf"
             | "presupported"
             | "pre-supported"
             | "supported"
@@ -36,6 +39,10 @@ pub(crate) fn technical(name: &str) -> bool {
             | "lychee"
             | "files"
     ) || SCALE.is_match(name)
+}
+
+pub(crate) fn absorbable_candidate(name: &str) -> bool {
+    technical(name) || is_pose_explicit(name) || is_pose_code(name)
 }
 
 #[derive(Default)]
@@ -125,15 +132,20 @@ pub(crate) fn group<'a>(
     for gap in coverage.gaps().filter(|path| !path.is_empty()) {
         let parent = parent_path(gap);
         let name = gap.rsplit('/').next().unwrap_or(gap);
-        incomplete_children.insert(parent);
-        if technical(name) || supported_extension(std::path::Path::new(name)).is_some() {
-            result.incomplete_packs.insert(parent.to_owned());
-        }
-        // A technical child with a gap cannot be proven terminal or folded.
-        if !parent.is_empty() && technical(parent.rsplit('/').next().unwrap_or(parent)) {
-            result
-                .incomplete_packs
-                .insert(parent_path(parent).to_owned());
+        incomplete_children.insert(WalkCoverage::key(parent));
+        if absorbable_candidate(name) || supported_extension(std::path::Path::new(name)).is_some() {
+            let mut anc = parent;
+            loop {
+                result.incomplete_packs.insert(WalkCoverage::key(anc));
+                if anc.is_empty() {
+                    break;
+                }
+                let seg = anc.rsplit('/').next().unwrap_or(anc);
+                if !absorbable_candidate(seg) {
+                    break;
+                }
+                anc = parent_path(anc);
+            }
         }
     }
     let mut frozen_packs = BTreeSet::new();
@@ -166,10 +178,21 @@ pub(crate) fn group<'a>(
             frozen_packs.insert(path);
             continue;
         }
-        if !parent_path(path).is_empty()
-            && frozen_packs.contains(parent_path(path))
-            && technical(dir.name)
-        {
+        let mut frozen_descendant = false;
+        let mut anc = path;
+        while !parent_path(anc).is_empty() {
+            let seg = anc.rsplit('/').next().unwrap_or(anc);
+            if !absorbable_candidate(seg) {
+                break;
+            }
+            let parent = parent_path(anc);
+            if frozen_packs.contains(parent) {
+                frozen_descendant = true;
+                break;
+            }
+            anc = parent;
+        }
+        if frozen_descendant {
             continue;
         }
         let mut members: Vec<_> = dir
@@ -178,19 +201,21 @@ pub(crate) fn group<'a>(
             .copied()
             .filter(|f| f.ext != "zip")
             .collect();
-        let mut absorbed = Vec::new();
+        let has_direct_non_zip = !members.is_empty();
+        let mut absorbed_dirs = Vec::new();
+        let mut absorbed_direct = 0usize;
         if !path.is_empty() {
             for &child in &dir.children {
-                let child_dir = &dirs[child];
-                if !child_dir.opaque
-                    && !coverage.unobserved(child)
-                    && !incomplete_children.contains(WalkCoverage::key(child).as_str())
-                    && child_dir.children.is_empty()
-                    && technical(child_dir.name)
-                    && !child_dir.files.iter().any(|f| f.ext == "zip")
-                {
-                    members.extend(&child_dir.files);
-                    absorbed.push(child);
+                if can_absorb_subtree(
+                    child,
+                    &dirs,
+                    coverage,
+                    &incomplete_children,
+                    false,
+                    has_direct_non_zip,
+                ) {
+                    absorbed_direct += 1;
+                    collect_subtree(child, &dirs, &mut members, &mut absorbed_dirs);
                 }
             }
         }
@@ -202,13 +227,13 @@ pub(crate) fn group<'a>(
             continue;
         }
         members.sort_unstable_by_key(|f| (is_image(f.ext), f.path));
-        result.folded.extend(absorbed.iter().copied());
+        result.folded.extend(absorbed_dirs.iter().copied());
         let leaf = !path.is_empty()
             && !technical(dir.name)
             && !direct_zip
             && !coverage.unobserved(path)
             && !incomplete_children.contains(WalkCoverage::key(path).as_str())
-            && absorbed.len() == dir.children.len();
+            && absorbed_direct == dir.children.len();
         let indirect_leaf = leaf && parent_path(members[0].path) != path;
         let model = if members.len() >= 2 || indirect_leaf {
             if leaf {
@@ -235,4 +260,54 @@ pub(crate) fn group<'a>(
     }
     result.models.sort_unstable_by_key(|model| model.path);
     result
+}
+
+fn can_absorb_subtree(
+    node: &str,
+    dirs: &BTreeMap<&str, Directory<'_>>,
+    coverage: &WalkCoverage,
+    incomplete_children: &BTreeSet<String>,
+    under_tech_or_pose: bool,
+    parent_has_direct_non_zip_files: bool,
+) -> bool {
+    let d = &dirs[node];
+    if d.opaque
+        || coverage.unobserved(node)
+        || incomplete_children.contains(&WalkCoverage::key(node))
+        || d.files.iter().any(|f| f.ext == "zip")
+    {
+        return false;
+    }
+    let tech_or_explicit = technical(d.name) || is_pose_explicit(d.name);
+    let code = is_pose_code(d.name);
+    if !tech_or_explicit && !code {
+        return false;
+    }
+    if code
+        && !under_tech_or_pose
+        && !parent_has_direct_non_zip_files
+        && !d
+            .children
+            .iter()
+            .any(|&c| technical(dirs[c].name) || is_pose_explicit(dirs[c].name))
+    {
+        return false;
+    }
+    d.children
+        .iter()
+        .all(|&c| can_absorb_subtree(c, dirs, coverage, incomplete_children, true, false))
+}
+
+fn collect_subtree<'a>(
+    node: &'a str,
+    dirs: &BTreeMap<&'a str, Directory<'a>>,
+    members: &mut Vec<Member<'a>>,
+    absorbed_dirs: &mut Vec<&'a str>,
+) {
+    let d = &dirs[node];
+    members.extend(&d.files);
+    absorbed_dirs.push(node);
+    for &c in &d.children {
+        collect_subtree(c, dirs, members, absorbed_dirs);
+    }
 }

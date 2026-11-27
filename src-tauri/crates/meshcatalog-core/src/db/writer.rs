@@ -13,8 +13,8 @@ use crate::{
     hasher::fingerprint,
     scanner::{
         attr_guard::unix_seconds,
-        grouping::{is_image, parent_path, technical, Grouping},
-        title::display_title,
+        grouping::{absorbable_candidate, is_image, parent_path, technical, Grouping},
+        title::contextual_display_title,
         walker::{InventoryEntry, WalkCoverage},
     },
 };
@@ -34,15 +34,16 @@ pub(crate) fn write_inventory_batch(
         for entry in entries {
             match entry {
                 InventoryEntry::Directory { rel_path, name, opaque } => {
-                    // A new technical child may disappear into its parent pack at grouping.
-                    let visible = *opaque || parent_path(rel_path).is_empty() || !technical(name);
+                    // A new absorbable candidate may disappear into its parent pack at grouping.
+                    let visible = *opaque || parent_path(rel_path).is_empty() || !absorbable_candidate(name);
                     let id = upsert_folder(&tx, source_id, rel_path,
                         if rel_path.is_empty() { &source_name } else { name }, visible)?;
                     folders.insert(id);
                 }
                 InventoryEntry::UnobservedLink { .. } => {}
                 InventoryEntry::File { rel_path, name, ext, metadata } => {
-                    let folder = folder_id(&tx, source_id, parent_path(rel_path))?;
+                    let parent_rel = parent_path(rel_path);
+                    let folder = folder_id(&tx, source_id, parent_rel)?;
                     if ext == "zip" {
                         reveal_folder(&tx, folder)?;
                     }
@@ -59,7 +60,7 @@ pub(crate) fn write_inventory_batch(
                         None if is_image(ext) => (None, folder),
                         None => {
                             let kind = if ext == "zip" { "zip_archive" } else { "single_file" };
-                            (Some(upsert_model(&tx, source_id, folder, kind, &uri, name, ext, cloud)?), folder)
+                            (Some(upsert_model(&tx, source_id, folder, parent_rel, kind, &uri, name, ext, cloud)?), folder)
                         }
                     };
                     let id: i64 = tx.prepare_cached(
@@ -117,7 +118,7 @@ pub(crate) fn write_groups(
             let uri = local_uri(&root, model.path);
             let name = if model.path.is_empty() { &source_name } else { model.name };
             let primary = model.members[0];
-            let id = upsert_model(&tx, source_id, folder, model.kind, &uri, name, primary.ext,
+            let id = upsert_model(&tx, source_id, folder, model.folder, model.kind, &uri, name, primary.ext,
                                   model.members.iter().any(|f| f.cloud))?;
             for member in &model.members {
                 let member_uri = local_uri(&root, member.path);
@@ -401,6 +402,7 @@ pub(crate) fn finish_scan(
                     }
                 }
             } else if !unobserved {
+                let stale_empty = stale.is_empty();
                 if let Some(previous) = history.get(path) {
                     // A path still observed on disk may simply have been regrouped.
                     if !previous.cloud
@@ -418,10 +420,10 @@ pub(crate) fn finish_scan(
                             }
                         }
                     }
-                    if !coverage.incomplete && !has_live_file {
+                    if !has_live_file && (!coverage.incomplete || stale_empty) {
                         obsolete.insert(id);
                     }
-                } else if !has_live_file && (!coverage.incomplete || stale.is_empty()) {
+                } else if !has_live_file && (!coverage.incomplete || stale_empty) {
                     // Empty Pass 1 provisional model, not a historical deletion.
                     obsolete.insert(id);
                 }
@@ -629,9 +631,11 @@ fn upsert_folder(
     let parent = (!path.is_empty())
         .then(|| folder_id(tx, source_id, parent_path(path)))
         .transpose()?;
-    if let Some(parent) = parent {
-        // A folder with subdirectories cannot be absorbed as a terminal technical child.
-        reveal_folder(tx, parent)?;
+    if visible {
+        if let Some(parent) = parent {
+            // A navigable child proves that none of its hidden ancestors were purely absorbed.
+            reveal_folder(tx, parent)?;
+        }
     }
     tx.prepare_cached(
         "INSERT INTO folders (source_id, parent_id, rel_path, name, is_visible) VALUES (?1,?2,?3,?4,?5)
@@ -642,8 +646,15 @@ fn upsert_folder(
 }
 
 fn reveal_folder(tx: &Transaction<'_>, id: i64) -> rusqlite::Result<()> {
-    tx.prepare_cached("UPDATE folders SET is_visible=1 WHERE id=?1 AND is_visible=0")?
-        .execute([id])?;
+    tx.prepare_cached(
+        "WITH RECURSIVE chain(id, parent_id) AS (
+            SELECT id, parent_id FROM folders WHERE id=?1
+            UNION ALL
+            SELECT f.id, f.parent_id FROM folders f JOIN chain c ON f.id=c.parent_id
+        )
+        UPDATE folders SET is_visible=1 WHERE id IN (SELECT id FROM chain) AND is_visible=0",
+    )?
+    .execute([id])?;
     Ok(())
 }
 
@@ -652,12 +663,14 @@ fn upsert_model(
     tx: &Transaction<'_>,
     source: i64,
     folder: i64,
+    folder_rel_path: &str,
     kind: &str,
     uri: &str,
     name: &str,
     ext: &str,
     cloud: bool,
 ) -> rusqlite::Result<i64> {
+    let title = contextual_display_title(folder_rel_path, name, technical);
     tx.prepare_cached(
         "INSERT INTO models (source_id, folder_id, container_kind, canonical_uri, raw_name, display_title,
            primary_ext, has_cloud_placeholder, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
@@ -665,7 +678,7 @@ fn upsert_model(
            raw_name=excluded.raw_name, display_title=excluded.display_title, primary_ext=excluded.primary_ext,
            has_cloud_placeholder=excluded.has_cloud_placeholder, updated_at=excluded.updated_at
          RETURNING id",
-    )?.query_row(params![source, folder, kind, uri, name, display_title(name), ext, cloud, unix_seconds(SystemTime::now())], |r| r.get(0))
+    )?.query_row(params![source, folder, kind, uri, name, title, ext, cloud, unix_seconds(SystemTime::now())], |r| r.get(0))
 }
 
 fn sync_file_fts(
@@ -708,6 +721,73 @@ fn sync_model(tx: &Transaction<'_>, root: &str, model: i64) -> rusqlite::Result<
     Ok(())
 }
 
+fn is_short_code(title: &str) -> bool {
+    let count = title.chars().count();
+    (1..=2).contains(&count) && title.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+fn push_unique_title(bucket: &mut Vec<String>, title: String) {
+    if bucket.len() < 4
+        && !bucket
+            .iter()
+            .any(|existing| existing.to_lowercase() == title.to_lowercase())
+    {
+        bucket.push(title);
+    }
+}
+
+#[derive(Default)]
+struct DirectTitles {
+    descriptive: Vec<String>,
+    short: Vec<String>,
+}
+
+impl DirectTitles {
+    fn push(&mut self, title: String) {
+        if is_short_code(&title) {
+            push_unique_title(&mut self.short, title);
+        } else {
+            push_unique_title(&mut self.descriptive, title);
+        }
+    }
+
+    fn into_vec(mut self) -> Vec<String> {
+        self.descriptive.extend(self.short);
+        self.descriptive
+    }
+}
+
+fn merge_sample_titles(direct: &[String], descendants: &[String]) -> Vec<String> {
+    let mut best = BTreeMap::<String, (bool, bool, String)>::new();
+    for (is_direct, list) in [(true, direct), (false, descendants)] {
+        for title in list {
+            let key = title.to_lowercase();
+            let candidate = (is_short_code(title), !is_direct, title.clone());
+            best.entry(key)
+                .and_modify(|current| {
+                    if (candidate.0, candidate.1, &candidate.2) < (current.0, current.1, &current.2)
+                    {
+                        *current = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+    }
+    let mut ranked: Vec<_> = best.into_values().collect();
+    ranked.sort_unstable_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+    ranked.truncate(4);
+    ranked.into_iter().map(|(_, _, title)| title).collect()
+}
+
+#[derive(Default)]
+struct DirectAggregate {
+    models: i64,
+    files: i64,
+    titles: DirectTitles,
+    formats: BTreeMap<String, i64>,
+    cloud: i64,
+}
+
 #[derive(Default)]
 struct Aggregate {
     models: i64,
@@ -721,15 +801,13 @@ struct Aggregate {
 fn refresh_folders(tx: &Transaction<'_>, source: i64) -> Result<Vec<i64>, IpcError> {
     let folders = tx.prepare("SELECT id, parent_id, is_visible FROM folders WHERE source_id=?1 ORDER BY rel_path COLLATE BINARY DESC")?
         .query_map([source], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, bool>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
-    let mut direct = BTreeMap::<i64, Aggregate>::new();
+    let mut direct = BTreeMap::<i64, DirectAggregate>::new();
     let mut stmt = tx.prepare("SELECT folder_id, display_title FROM models WHERE source_id=?1 AND folder_id IS NOT NULL ORDER BY folder_id, display_title COLLATE NOCASE, id")?;
     let mut rows = stmt.query([source])?;
     while let Some(row) = rows.next()? {
         let folder = direct.entry(row.get(0)?).or_default();
         folder.models += 1;
-        if folder.titles.len() < 4 {
-            folder.titles.push(row.get(1)?);
-        }
+        folder.titles.push(row.get(1)?);
     }
     let mut stmt = tx.prepare("SELECT folder_id, ext, count(*), sum(storage_state='cloud_placeholder') FROM files WHERE source_id=?1 AND folder_id IS NOT NULL GROUP BY folder_id, ext")?;
     let mut rows = stmt.query([source])?;
@@ -749,7 +827,15 @@ fn refresh_folders(tx: &Transaction<'_>, source: i64) -> Result<Vec<i64>, IpcErr
         let here = direct.remove(&id).unwrap_or_default();
         let mut tree = recursive.remove(&id).unwrap_or_default();
         let (model_count, file_count) = (here.models, here.files);
-        tree.merge(here);
+        let here_titles = here.titles.into_vec();
+        let sample_titles = merge_sample_titles(&here_titles, &tree.titles);
+        tree.models += here.models;
+        tree.files += here.files;
+        tree.cloud += here.cloud;
+        for (ext, count) in here.formats {
+            *tree.formats.entry(ext).or_default() += count;
+        }
+        tree.titles = sample_titles;
         let mut summary = json!(tree.formats);
         summary["cloud"] = json!(tree.cloud);
         update.execute(params![
@@ -776,9 +862,10 @@ impl Aggregate {
         self.files += other.files;
         self.folder_count += other.folder_count;
         self.cloud += other.cloud;
-        self.titles.extend(other.titles);
-        self.titles.sort_unstable();
-        self.titles.truncate(4);
+        self.titles = merge_sample_titles(
+            &[],
+            &[self.titles.as_slice(), other.titles.as_slice()].concat(),
+        );
         for (ext, count) in other.formats {
             *self.formats.entry(ext).or_default() += count;
         }

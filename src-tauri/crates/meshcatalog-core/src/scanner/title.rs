@@ -10,6 +10,41 @@ static NOISE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SCALES: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\d+(?:[.,]\d+)?\s*mm|1[_-]\d+").unwrap());
+static POSE_EXPLICIT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:(?:pose|poses|variant|variants|var|version|ver)[\s_.-]*(?:[a-z]|\d{1,2})?|v\d{1,2})$").unwrap()
+});
+static POSE_CODE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:[A-Za-z]|\d{1,2})$").unwrap());
+
+pub(crate) fn is_pose_explicit(name: &str) -> bool {
+    POSE_EXPLICIT.is_match(name.trim())
+}
+
+pub(crate) fn is_pose_code(name: &str) -> bool {
+    POSE_CODE.is_match(name.trim())
+}
+
+pub(crate) fn is_bare_pose_title(title: &str) -> bool {
+    is_pose_code(title) || is_pose_explicit(title)
+}
+
+pub(crate) fn contextual_display_title(
+    folder_rel_path: &str,
+    raw_name: &str,
+    is_technical_dir: impl Fn(&str) -> bool,
+) -> String {
+    let clean = display_title(raw_name);
+    if !folder_rel_path.is_empty() && is_bare_pose_title(&clean) {
+        if let Some(seg) = folder_rel_path
+            .rsplit('/')
+            .find(|seg| !seg.is_empty() && !is_technical_dir(seg) && !is_bare_pose_title(seg))
+        {
+            let parent = display_title(seg);
+            return format!("{parent} - {clean}");
+        }
+    }
+    clean
+}
 
 pub(crate) fn display_title(raw: &str) -> String {
     let mut title = raw;

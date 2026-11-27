@@ -64,7 +64,7 @@ Rappresenta un nodo fisico della gerarchia. Solo `is_visible = 1` compare nell'a
 | `recursive_model_count` | `INTEGER NOT NULL DEFAULT 0` | Totale modelli nell'intero sotto-albero (incluso sé stesso) |
 | `recursive_file_count` | `INTEGER NOT NULL DEFAULT 0` | Totale file nell'intero sotto-albero (incluse entry `.zip`) |
 | `nested_folder_count` | `INTEGER NOT NULL DEFAULT 0` | Numero totale di sottocartelle navigabili discendenti nel sotto-albero |
-| `sample_titles_json` | `TEXT` | Array JSON dei primi 3–4 `display_title` rappresentativi del sotto-albero |
+| `sample_titles_json` | `TEXT` | Array JSON dei primi 3–4 `display_title` rappresentativi deduplicati (priorità ai modelli diretti e sigle brevi di 1–2 caratteri posticipate) |
 | `hero_thumb_id` | `INTEGER` | Predisposto per M2 (`NULL` in M1) |
 | `preview_json` | `TEXT` | Predisposto per M3 Smart Folder (`NULL` in M1) |
 | `summary_json` | `TEXT` | JSON riepilogo estensioni/stati sul sotto-albero (es. `{"stl":42,"zip":3,"cloud":5}`; include sempre `"cloud"` per derivare `FolderCardDto.hasCloudPlaceholder = cloud > 0`) |
@@ -95,7 +95,7 @@ Unità logica mostrata nella vista predefinita **Modelli / Pack**.
 
 **Regole di Raggruppamento Deterministiche (FR-007) e `models.folder_id`:**
 1. **`zip_archive`**: ogni file `.zip` rilevato (residente o placeholder), associato al `folder_id` della cartella che lo contiene.
-2. **`folder_pack`**: cartella `P` con almeno `2` membri 3D/slicer non-`.zip` oppure `1` membro 3D/slicer e `>= 1` immagine. I membri possono provenire da sottocartelle tecniche terminali assorbite come in FR-007. La radice sorgente non assorbe sottocartelle tecniche. Una cartella foglia non tecnica (`P` non è la radice, non ha `.zip` né sottocartelle non assorbite) forma un pack anche con un solo membro 3D/slicer in una sottocartella tecnica assorbita, es. `Boss_Krull/STL/body.stl`. Il modello prende nome e URI da `P`; `models.folder_id = id(parent(P))` e `P` non compare tra le cartelle navigabili. I pack nelle cartelle miste, tecniche non assorbite o radice usano `models.folder_id = id(P)`.
+2. **`folder_pack`**: cartella `P` con almeno `2` membri 3D/slicer non-`.zip` oppure `1` membro 3D/slicer e `>= 1` immagine. I membri possono provenire ricorsivamente da sottoalberi tecnici o di posa/variante assorbiti come in FR-007 (senza `.zip` né rami opachi). La radice sorgente non assorbe sottocartelle tecniche o varianti. Una cartella foglia non tecnica (`P` non è la radice, non ha `.zip` né sottocartelle non assorbite) forma un pack anche con un solo membro 3D/slicer in una sottocartella assorbita, es. `Boss_Krull/STL/body.stl`. Il modello prende nome e URI da `P` (contestualizzato col genitore se `P` è una sigla di posa non assorbita); `models.folder_id = id(parent(P))` e `P` non compare tra le cartelle navigabili. I pack nelle cartelle miste, tecniche non assorbite o radice usano `models.folder_id = id(P)`.
 3. **`single_file`**: singolo file 3D/slicer senza compagni né immagini che non ricade nell'eccezione della foglia; mantiene il nome del file e il `folder_id` del livello logico di raggruppamento. Il caso di un singolo file diretto resta invariato.
 
 ---
